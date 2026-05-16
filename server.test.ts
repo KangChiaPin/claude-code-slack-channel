@@ -9846,6 +9846,7 @@ describe('buildAndPostAuditReceipt unfurl flags (ccsc-y4e)', () => {
 })
 
 // ---------------------------------------------------------------------------
+<<<<<<< HEAD
 // ACP boundary adapter — ccsc-21x
 // ---------------------------------------------------------------------------
 //
@@ -13919,5 +13920,46 @@ describe('ccsc-l1f — runAuditKeyCli (dispatch + defaults)', () => {
     if (result.kind !== 'error') throw new Error('expected error')
     expect(result.message).toContain('Unknown subcommand')
     expect(errs.some((m) => m.toLowerCase().includes('usage'))).toBe(true)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// deriveRoleForSender — optional role-hook integration (additive, no-op
+// unless OWNER_SLACK_USER_ID + SLACK_ROLE_HOOK_FILE are both set at boot).
+// ---------------------------------------------------------------------------
+
+describe('deriveRoleForSender', () => {
+  const loadLib = async () => await import('./lib.ts')
+
+  test('exact user_id match → owner', async () => {
+    const { deriveRoleForSender } = await loadLib()
+    expect(deriveRoleForSender('U12345', 'U12345')).toBe('owner')
+  })
+
+  test('any other user_id → contributor', async () => {
+    const { deriveRoleForSender } = await loadLib()
+    expect(deriveRoleForSender('U99999', 'U12345')).toBe('contributor')
+    expect(deriveRoleForSender('', 'U12345')).toBe('contributor')
+  })
+
+  test('empty owner id never promotes (misconfig protection)', async () => {
+    // If OWNER_SLACK_USER_ID is unset, deriveRoleForSender must NOT
+    // promote anyone to owner — including the synthetic '' sender. A
+    // boot-time empty-owner guard already disables the role hook entirely
+    // (ROLE_HOOK_ENABLED), but this is the defense-in-depth check.
+    const { deriveRoleForSender } = await loadLib()
+    expect(deriveRoleForSender('', '')).toBe('contributor')
+    expect(deriveRoleForSender('U12345', '')).toBe('contributor')
+  })
+
+  test('case-sensitive (Slack user_ids are case-sensitive opaque)', async () => {
+    const { deriveRoleForSender } = await loadLib()
+    expect(deriveRoleForSender('u12345', 'U12345')).toBe('contributor')
+  })
+
+  test('substring match is NOT enough — exact equality only', async () => {
+    const { deriveRoleForSender } = await loadLib()
+    expect(deriveRoleForSender('U12345EXTRA', 'U12345')).toBe('contributor')
+    expect(deriveRoleForSender('U12345', 'U12345EXTRA')).toBe('contributor')
   })
 })

@@ -35,6 +35,7 @@ import {
   chunkText,
   decidePermissionRoute,
   defaultAccess,
+  deriveRoleForSender,
   detectNewAllowFrom,
   EVENT_DEDUP_TTL_MS,
   enforceAuditReceiptCap,
@@ -57,6 +58,7 @@ import {
   pruneExpired,
   recordApprovalVote,
   resolveJournalPath,
+  type SenderRole,
   sanitizeDisplayName,
   sanitizeFilename,
   stripBotMention,
@@ -154,6 +156,42 @@ try {
 } catch (err) {
   console.error(`[slack] ${err instanceof Error ? err.message : String(err)}`)
   process.exit(1)
+}
+
+// Optional role-hook integration: when BOTH env vars are set, the server
+// writes the inbound sender's derived role ('owner' or 'contributor') to
+// SLACK_ROLE_HOOK_FILE on every delivered message, and adds a `role`
+// attribute to the MCP notification's meta. Lets downstream Claude Code
+// hooks (e.g. PreToolUse) do filesystem-level role gating without parsing
+// the MCP stream. No-op when either env var is empty — fully backward
+// compatible.
+//
+// Role derivation is pure user_id equality (see `deriveRoleForSender` in
+// lib.ts). user_id is set by Slack, not by message content — so the role
+// hook does not introduce a new prompt-injection surface. The plugin
+// itself still does NOT enforce role-based tool gating; policy.ts remains
+// the in-plugin authority. The role hook exists for host integrations
+// that need to gate at the filesystem layer.
+const OWNER_USER_ID = process.env.OWNER_SLACK_USER_ID || ''
+const ROLE_HOOK_FILE = process.env.SLACK_ROLE_HOOK_FILE || ''
+const ROLE_HOOK_ENABLED = OWNER_USER_ID !== '' && ROLE_HOOK_FILE !== ''
+
+/** Atomically write the resolved role to SLACK_ROLE_HOOK_FILE.
+ *
+ *  Write to a sibling tmp file then rename so a concurrent reader (the
+ *  PreToolUse hook) never observes a half-written file. Best-effort: errors
+ *  are logged and swallowed — failing to write the hook file MUST NOT block
+ *  inbound message delivery to Claude. */
+function writeRoleHookFileAtomic(filePath: string, role: SenderRole): void {
+  const tmp = `${filePath}.${process.pid}.tmp`
+  try {
+    writeFileSync(tmp, `${role}\n`, { mode: 0o600 })
+    renameSync(tmp, filePath)
+  } catch (err) {
+    console.error(
+      `[slack] failed to write role hook file ${filePath}: ${err instanceof Error ? err.message : String(err)}`,
+    )
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -2703,6 +2741,16 @@ async function deliverEvent(ev: Record<string, unknown>, access: Access): Promis
   let text = (ev.text as string | undefined) || ''
   if (botUserId) {
     text = text.replace(new RegExp(`<@${botUserId}>\\s*`, 'g'), '').trim()
+  }
+
+  // Optional role-hook integration (no-op unless OWNER_SLACK_USER_ID +
+  // SLACK_ROLE_HOOK_FILE are both set; see boot-time constants above).
+  // user_id is the trustworthy Slack-set identifier — see comment on the
+  // `userIdSafe` derivation above.
+  if (ROLE_HOOK_ENABLED) {
+    const role = deriveRoleForSender(userIdSafe, OWNER_USER_ID)
+    meta.role = role
+    writeRoleHookFileAtomic(ROLE_HOOK_FILE, role)
   }
 
   // Push into Claude Code session via MCP notification

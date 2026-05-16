@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added (fork-only — KangChiaPin/feat/owner-role-hook)
+
+- **Optional owner-role hook integration** for host integrations that gate at the filesystem layer (e.g. Claude Code PreToolUse hooks reading a sidecar role file outside the MCP notification stream). Two new env vars: `OWNER_SLACK_USER_ID` (the Slack user_id treated as "owner") and `SLACK_ROLE_HOOK_FILE` (path the server atomically rewrites on each inbound). When BOTH are set, on every delivered inbound the server (a) derives the sender's role via exact user_id equality (`deriveRoleForSender` — owner iff `userIdSafe === OWNER_SLACK_USER_ID`), (b) adds `role` to the MCP notification's `meta`, (c) atomically writes `owner\n` or `contributor\n` to `SLACK_ROLE_HOOK_FILE` (tmp + rename, mode 0o600, errors logged and swallowed). When either env var is empty, the feature is a complete no-op — fully backward compatible. The plugin itself does NOT enforce role-based tool gating; policy.ts remains the in-plugin authority. user_id is the Slack-set opaque identifier (not message content), so the role hook does not introduce a new prompt-injection surface. Adds 5 unit tests for `deriveRoleForSender` covering exact match, empty-owner misconfig, case sensitivity, and substring rejection.
+
 ## [0.10.0] - 2026-05-24
 
 ### Added

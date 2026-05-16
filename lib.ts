@@ -1820,6 +1820,31 @@ export function buildAuditReceiptMessage(
  *  before any state setup (no state dir, no tokens, no Slack client).
  *  That's intentional: verifying a journal file is a pure offline read.
  */
+export type SenderRole = 'owner' | 'contributor'
+
+/** Derive a sender's role for the optional role-hook integration.
+ *
+ *  A message's sender is "owner" iff their Slack user_id matches the
+ *  configured OWNER_SLACK_USER_ID exactly; everyone else is "contributor".
+ *  user_id is the opaque Slack-controlled identifier (set by Slack itself,
+ *  not by message content) — the same trust property server.ts relies on
+ *  when populating `meta.user_id`. Display name is not consulted.
+ *
+ *  This is the only authority decision the role hook makes; downstream
+ *  hooks (e.g. a PreToolUse hook reading SLACK_ROLE_HOOK_FILE) consume the
+ *  result. The plugin itself does NOT enforce role-based tool gating —
+ *  policy.ts remains the in-plugin authority. The role hook exists so host
+ *  integrations can do filesystem-level role gating outside the MCP
+ *  notification stream.
+ *
+ *  Returns "contributor" for the empty-owner sentinel so a misconfigured
+ *  OWNER_SLACK_USER_ID="" does not silently promote everyone to owner.
+ */
+export function deriveRoleForSender(senderUserId: string, ownerUserId: string): SenderRole {
+  if (!ownerUserId) return 'contributor'
+  return senderUserId === ownerUserId ? 'owner' : 'contributor'
+}
+
 export function parseVerifyArg(argv: ReadonlyArray<string>): string | null {
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i]!
