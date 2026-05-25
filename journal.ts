@@ -133,6 +133,17 @@ export const EventKind = z.enum([
   // publish_manifest call, carrying the replaced-count so operators can see
   // how many prior manifests were unpinned during the replace sweep.
   'manifest.publish',
+  // User-token (xoxp-) DM reads via the fork-only fetch_user_dms tool.
+  // Every call writes one of these two events so an operator can later
+  // audit "what conversations has this topic agent peeked at with my
+  // identity?" — the user token's blast radius is wide enough that
+  // forensic visibility is the price of even allowing the tool. .read
+  // records a successful peek (target user_id + channel id + message
+  // count, but never message bodies — those go through MCP back to the
+  // calling Claude session); .deny records a refusal (no user token
+  // configured, target not in allowlist, no open DM, etc.).
+  'gate.user_token.read',
+  'gate.user_token.deny',
 ])
 
 /** TypeScript string union of the 22 event kinds. */

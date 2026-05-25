@@ -5544,9 +5544,10 @@ describe('JournalEvent', () => {
     // (ccsc-22l) + policy.deny.context_stripped (ccsc-06s) +
     // 5 admin.* kinds (ccsc-3w0) + system.stream_finalize (ccsc-ele) +
     // 4 admin.mute/unmute kinds (ccsc-gjm: admin.mute, admin.mute.denied,
-    // admin.unmute, admin.unmute.denied). If this number drifts, update
-    // the doc count in journal.ts's header comment too.
-    expect(kinds).toHaveLength(34)
+    // admin.unmute, admin.unmute.denied) + 2 fork-only user-token kinds
+    // (gate.user_token.read, gate.user_token.deny). If this number
+    // drifts, update the doc count in journal.ts's header comment too.
+    expect(kinds).toHaveLength(36)
     expect(kinds).toContain('manifest.read')
     expect(kinds).toContain('manifest.read.cached')
     expect(kinds).toContain('manifest.publish')
@@ -5562,6 +5563,8 @@ describe('JournalEvent', () => {
     expect(kinds).toContain('admin.mute.denied')
     expect(kinds).toContain('admin.unmute')
     expect(kinds).toContain('admin.unmute.denied')
+    expect(kinds).toContain('gate.user_token.read')
+    expect(kinds).toContain('gate.user_token.deny')
     for (const k of kinds) {
       expect(() => JournalEvent.parse(minimal({ kind: k }))).not.toThrow()
     }

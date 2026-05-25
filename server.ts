@@ -201,7 +201,7 @@ function writeRoleHookFileAtomic(filePath: string, role: SenderRole): void {
 mkdirSync(STATE_DIR, { recursive: true })
 mkdirSync(INBOX_DIR, { recursive: true })
 
-function loadEnv(): { botToken: string; appToken: string } {
+function loadEnv(): { botToken: string; appToken: string; userToken: string } {
   if (!existsSync(ENV_FILE)) {
     console.error(
       `[slack] No .env found at ${ENV_FILE}\n` +
@@ -230,6 +230,11 @@ function loadEnv(): { botToken: string; appToken: string } {
 
   const botToken = vars.SLACK_BOT_TOKEN || ''
   const appToken = vars.SLACK_APP_TOKEN || ''
+  // SLACK_USER_TOKEN is OPTIONAL: presence enables the fetch_user_dms
+  // tool (owner-impersonating reads via xoxp-). Absence keeps the
+  // bot in bot-token-only mode (no user-DM peeking). Fork addition;
+  // upstream doesn't carry this knob.
+  const userToken = vars.SLACK_USER_TOKEN || ''
 
   if (!botToken.startsWith('xoxb-')) {
     console.error('[slack] SLACK_BOT_TOKEN must start with xoxb-')
@@ -239,11 +244,15 @@ function loadEnv(): { botToken: string; appToken: string } {
     console.error('[slack] SLACK_APP_TOKEN must start with xapp-')
     process.exit(1)
   }
+  if (userToken && !userToken.startsWith('xoxp-')) {
+    console.error('[slack] SLACK_USER_TOKEN (if set) must start with xoxp-')
+    process.exit(1)
+  }
 
-  return { botToken, appToken }
+  return { botToken, appToken, userToken }
 }
 
-const { botToken, appToken } = loadEnv()
+const { botToken, appToken, userToken } = loadEnv()
 
 // ---------------------------------------------------------------------------
 // Slack clients
@@ -251,6 +260,12 @@ const { botToken, appToken } = loadEnv()
 
 const web = new WebClient(botToken)
 const socket = new SocketModeClient({ appToken })
+// userClient is the owner-OAuth client used ONLY by the fetch_user_dms
+// tool. Initialized lazily (null when SLACK_USER_TOKEN is unset) so the
+// rest of the server stays untouched in bot-only deployments. Treat the
+// token as "the human's Slack identity" — see comments around the tool
+// registration for the gate semantics.
+const userClient: WebClient | null = userToken ? new WebClient(userToken) : null
 
 let botUserId = ''
 let selfBotId = ''
@@ -779,6 +794,21 @@ const FetchMessagesInput = z
   })
   .strict()
 
+// fetch_user_dms reads with the owner's xoxp- token. Strict input
+// validation matters more than usual because the tool's blast radius
+// is "every DM the owner can see". target_user_id pattern enforces
+// the Slack opaque-ID format so the agent can't sneak in arbitrary
+// strings; limit hard-capped to 200 to bound any single peek.
+const FetchUserDmsInput = z
+  .object({
+    target_user_id: z
+      .string()
+      .regex(/^[UW][A-Z0-9]{2,30}$/, 'target_user_id must be a Slack user_id (U.../W...)'),
+    limit: z.number().int().positive().max(200).optional(),
+    oldest: z.string().optional(),
+  })
+  .strict()
+
 const DownloadAttachmentInput = z
   .object({
     chat_id: z.string().min(1),
@@ -825,6 +855,7 @@ export const toolSchemas = {
   react: ReactInput,
   edit_message: EditMessageInput,
   fetch_messages: FetchMessagesInput,
+  fetch_user_dms: FetchUserDmsInput,
   download_attachment: DownloadAttachmentInput,
   list_sessions: ListSessionsInput,
   read_peer_manifests: ReadPeerManifestsInput,
@@ -901,6 +932,31 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
           },
         },
         required: ['channel'],
+      },
+    },
+    {
+      name: 'fetch_user_dms',
+      description:
+        "Fetch DM history with a specific user, using the owner's user OAuth token (xoxp-). Refuses when SLACK_USER_TOKEN is not configured OR target_user_id is not in access.userDmAllowlist. Use sparingly — every call is journaled and counts as the owner reading the conversation. Never call this without a topic-relevance reason; do not export the resulting messages to memory without owner approval.",
+      inputSchema: {
+        type: 'object' as const,
+        properties: {
+          target_user_id: {
+            type: 'string',
+            description:
+              "Slack user_id of the other party in the DM (e.g. 'U0ABCDE1FG'). Must be in access.userDmAllowlist.",
+          },
+          limit: {
+            type: 'number',
+            description: 'Max messages to fetch (default 50, hard cap 200).',
+          },
+          oldest: {
+            type: 'string',
+            description:
+              'Optional Slack ts string lower bound — only messages newer than this are returned.',
+          },
+        },
+        required: ['target_user_id'],
       },
     },
     {
@@ -1340,6 +1396,112 @@ async function executeFetchMessages(
         user_id: m.user,
         text: m.text,
         thread_ts: m.thread_ts,
+        files: m.files?.map((f: any) => ({
+          name: f.name,
+          mimetype: f.mimetype,
+          size: f.size,
+        })),
+      }
+    }),
+  )
+
+  return {
+    content: [{ type: 'text', text: JSON.stringify(formatted, null, 2) }],
+  }
+}
+
+// -----------------------------------------------------------------------
+// fetch_user_dms — owner-impersonating DM read
+//
+// Two gates before any Slack call lands:
+//   1. SLACK_USER_TOKEN must be configured at boot (userClient !== null).
+//      Unconfigured = the operator opted out of the user-token path
+//      entirely; refuse with a structured error.
+//   2. target_user_id must be in access.userDmAllowlist. The user
+//      token can technically reach every DM the owner can see; this
+//      list narrows the access to a vetted subset the operator chose
+//      for THIS topic agent. Empty list = refuse everything.
+//
+// Every call — allow OR deny — writes a `gate.user_token.read` journal
+// event so an operator can later audit "what DMs has this topic agent
+// read with my identity?".
+// -----------------------------------------------------------------------
+async function executeFetchUserDms(
+  args: Record<string, any>,
+  ctx: ToolContext,
+): Promise<ToolResult> {
+  const targetUserId: string = args.target_user_id
+  const limit = Math.min(args.limit || 50, 200)
+  const oldest: string | undefined = args.oldest
+
+  if (!userClient) {
+    ctx.journalWrite({
+      kind: 'gate.user_token.deny',
+      outcome: 'deny',
+      toolName: 'fetch_user_dms',
+      input: { target_user_id: targetUserId },
+      reason: 'SLACK_USER_TOKEN not configured on this host',
+    })
+    throw new Error(
+      'fetch_user_dms refused: SLACK_USER_TOKEN not configured (set it in bot.env to opt in)',
+    )
+  }
+
+  const access = ctx.getAccess()
+  const allowlist = access.userDmAllowlist || []
+  if (!allowlist.includes(targetUserId)) {
+    ctx.journalWrite({
+      kind: 'gate.user_token.deny',
+      outcome: 'deny',
+      toolName: 'fetch_user_dms',
+      input: { target_user_id: targetUserId },
+      reason: 'target_user_id not in access.userDmAllowlist',
+    })
+    throw new Error(`fetch_user_dms refused: ${targetUserId} not in access.userDmAllowlist`)
+  }
+
+  // Resolve the DM channel. conversations.list with the user token
+  // returns IM channels the owner has open. Filter by user field.
+  const listRes = await userClient.conversations.list({ types: 'im', limit: 1000 })
+  const dm = (listRes.channels || []).find((c: any) => c.user === targetUserId)
+  if (!dm?.id) {
+    ctx.journalWrite({
+      kind: 'gate.user_token.deny',
+      outcome: 'deny',
+      toolName: 'fetch_user_dms',
+      input: { target_user_id: targetUserId },
+      reason: 'no open DM with target user',
+    })
+    throw new Error(`fetch_user_dms: owner has no open DM with ${targetUserId}`)
+  }
+
+  const histArgs: { channel: string; limit: number; oldest?: string } = {
+    channel: dm.id,
+    limit,
+  }
+  if (oldest) histArgs.oldest = oldest
+  const histRes = await userClient.conversations.history(histArgs)
+  const messages = (histRes.messages || []).reverse() // oldest-first
+
+  ctx.journalWrite({
+    kind: 'gate.user_token.read',
+    outcome: 'allow',
+    toolName: 'fetch_user_dms',
+    input: {
+      target_user_id: targetUserId,
+      channel: dm.id,
+      message_count: messages.length,
+    },
+  })
+
+  const formatted = await Promise.all(
+    messages.map(async (m: any) => {
+      const userName = m.user ? await ctx.resolveUserName(m.user) : 'unknown'
+      return {
+        ts: m.ts,
+        user: userName,
+        user_id: m.user,
+        text: m.text,
         files: m.files?.map((f: any) => ({
           name: f.name,
           mimetype: f.mimetype,
@@ -1802,6 +1964,7 @@ const toolHandlers: Record<string, ToolHandler> = {
   react: executeReact,
   edit_message: executeEditMessage,
   fetch_messages: executeFetchMessages,
+  fetch_user_dms: executeFetchUserDms,
   download_attachment: executeDownloadAttachment,
   list_sessions: executeListSessions,
   read_peer_manifests: executeReadPeerManifests,

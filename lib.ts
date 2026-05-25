@@ -100,6 +100,16 @@ export interface Access {
    *  they get *some* signal rather than silence. Missing/empty =
    *  preserve the original silent-drop behaviour. */
   deniedDmReply?: string
+  /** Allowlist of Slack user_ids whose DMs the fetch_user_dms tool
+   *  is permitted to read via the owner's xoxp- user token. The
+   *  user token can technically reach every DM the owner can see;
+   *  this list narrows access to a vetted subset (e.g. "the people
+   *  whose direct conversations with me are relevant to THIS topic
+   *  agent"). Missing/empty = refuse every read — default-safe.
+   *  The fetch_user_dms tool is also a no-op when SLACK_USER_TOKEN
+   *  itself is unset, so this field only matters in deployments
+   *  that opted into the user-token path. */
+  userDmAllowlist?: string[]
   textChunkLimit?: number
   chunkMode?: 'length' | 'newline'
   /** Optional array of declarative policy rules, consumed by the
