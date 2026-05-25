@@ -1094,10 +1094,15 @@ async function executeReplyStreamingPath(opts: {
       // Visual progress markers on the streamed message itself: ⏳ at
       // start, ✅ at success, ⚠️ on mid-stream failure. Lets operators
       // spot in-flight / done / interrupted streams without opening
-      // the journal. Fire-and-forget — a failed reactions.add never
-      // propagates back to streamReply (it's wrapped in .catch there).
+      // the journal. Fire-and-forget — failed reactions never
+      // propagate back to streamReply (wrapped in .catch there).
+      // removeReaction pairs with addReaction so the terminal marker
+      // replaces the in-flight one cleanly instead of accumulating.
       addReaction: async (a) => {
         await ctx.web.reactions.add({ channel: a.channel, timestamp: a.ts, name: a.name })
+      },
+      removeReaction: async (a) => {
+        await ctx.web.reactions.remove({ channel: a.channel, timestamp: a.ts, name: a.name })
       },
     },
   )

@@ -95,6 +95,26 @@ export interface StreamReplyDeps {
    *  / done / interrupted without reading the journal. Optional and
    *  fire-and-forget — failures here never abort the stream. */
   addReaction?: (args: { channel: string; ts: string; name: string }) => Promise<void>
+  /** Optional companion to addReaction — used to remove the
+   *  in-flight marker (`hourglass_flowing_sand`) before adding the
+   *  terminal one. When absent the in-flight reaction is left in
+   *  place alongside the terminal one (more visual clutter but no
+   *  failure). Same fire-and-forget semantics as addReaction. */
+  removeReaction?: (args: { channel: string; ts: string; name: string }) => Promise<void>
+}
+
+// ---------------------------------------------------------------------------
+// Internal helpers
+// ---------------------------------------------------------------------------
+
+/** Mid-stream failure reasons go into a user-visible chat.update — they
+ *  can be raw Slack API errors carrying internal paths, stack traces,
+ *  or multi-line dumps. Truncate + flatten so the suffix stays a
+ *  single readable line and doesn't leak operator-host internals into
+ *  the Slack channel. */
+function sanitizeFailureReason(reason: string): string {
+  const flattened = reason.replace(/[\n\r]+/g, ' ').replace(/\s+/g, ' ').trim()
+  return flattened.length <= 120 ? flattened : `${flattened.slice(0, 117)}...`
 }
 
 /** Configuration for one stream. `channel` + `text` are required;
@@ -283,15 +303,22 @@ export async function streamReply(
       // sees that the partial reply is intentionally truncated. Try
       // updateMessage one more time — if it fails (e.g. the channel
       // is genuinely revoked), swallow and rely on the reaction +
-      // journal entry instead.
+      // journal entry instead. Reason is sanitized so internal paths /
+      // stack-trace bytes don't bleed into the Slack channel.
+      const userReason = sanitizeFailureReason(reason)
       try {
         await deps.updateMessage({
           channel: opts.channel,
           ts,
-          text: `${cumulative}\n\n⚠️ stream interrupted — partial reply (${reason})`,
+          text: `${cumulative}\n\n⚠️ stream interrupted — partial reply (${userReason})`,
         })
       } catch {
         /* tried, accept partial visibility */
+      }
+      if (deps.removeReaction) {
+        deps.removeReaction({ channel: opts.channel, ts, name: 'hourglass_flowing_sand' }).catch(
+          (e) => console.error('[slack] stream removeReaction(hourglass) failed', e),
+        )
       }
       if (deps.addReaction) {
         deps.addReaction({ channel: opts.channel, ts, name: 'warning' }).catch(
@@ -315,6 +342,11 @@ export async function streamReply(
   }
 
   await finalizeJournal(deps, opts, ts, chunksSent, committedHash, 'allow')
+  if (deps.removeReaction) {
+    deps.removeReaction({ channel: opts.channel, ts, name: 'hourglass_flowing_sand' }).catch(
+      (err) => console.error('[slack] stream removeReaction(hourglass) failed', err),
+    )
+  }
   if (deps.addReaction) {
     deps.addReaction({ channel: opts.channel, ts, name: 'white_check_mark' }).catch(
       (err) => console.error('[slack] stream addReaction(check) failed', err),

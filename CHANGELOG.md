@@ -7,9 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Added (fork-only — KangChiaPin/feat/owner-role-hook)
+<!-- Upstream [Unreleased] tracks unreleased upstream work. Fork-only
+     additions live in the "Fork additions" block below — keeping them
+     separate so future rebases can replay or upstream them cleanly
+     without scraping prose. -->
+
+## Fork additions (KangChiaPin/feat/owner-role-hook, not upstreamed)
+
+### Added
 
 - **Optional owner-role hook integration** for host integrations that gate at the filesystem layer (e.g. Claude Code PreToolUse hooks reading a sidecar role file outside the MCP notification stream). Two new env vars: `OWNER_SLACK_USER_ID` (the Slack user_id treated as "owner") and `SLACK_ROLE_HOOK_FILE` (path the server atomically rewrites on each inbound). When BOTH are set, on every delivered inbound the server (a) derives the sender's role via exact user_id equality (`deriveRoleForSender` — owner iff `userIdSafe === OWNER_SLACK_USER_ID`), (b) adds `role` to the MCP notification's `meta`, (c) atomically writes `owner\n` or `contributor\n` to `SLACK_ROLE_HOOK_FILE` (tmp + rename, mode 0o600, errors logged and swallowed). When either env var is empty, the feature is a complete no-op — fully backward compatible. The plugin itself does NOT enforce role-based tool gating; policy.ts remains the in-plugin authority. user_id is the Slack-set opaque identifier (not message content), so the role hook does not introduce a new prompt-injection surface. Adds 5 unit tests for `deriveRoleForSender` covering exact match, empty-owner misconfig, case sensitivity, and substring rejection.
+- **Canned reply for non-allowlisted DMs.** New optional `Access.deniedDmReply` string. When set + a DM lands from a user not in `allowFrom` while `dmPolicy` is `allowlist`/`disabled`, the inbound gate still drops the event (no MCP forward, zero Claude tokens) but populates `GateResult.cannedReply` so server.ts can `chat.postMessage` the configured text as a breadcrumb. Missing/empty preserves the original silent-drop default.
+- **Stream-reply UX polish: progress reactions + sanitized interrupt suffix.** `streamReply` accepts optional `addReaction` + `removeReaction` deps. When wired, the streamer marks the message with ⏳ (`hourglass_flowing_sand`) at start, replaces it with ✅ on success or ⚠️ on mid-stream failure (remove old → add new keeps the message clean). Mid-stream failures also append a single-line, length-capped, internals-redacted suffix to the partial reply so the user sees the truncation was intentional. All reaction calls are fire-and-forget; failures never abort the stream.
 
 ## [0.10.0] - 2026-05-24
 
