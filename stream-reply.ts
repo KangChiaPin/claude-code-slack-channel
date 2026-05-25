@@ -88,6 +88,13 @@ export interface StreamReplyDeps {
    *  rate limit. Tests inject a no-op or instrumented version to
    *  exercise the rate-limit branch without wall-clock waits. */
   sleep: (ms: number) => Promise<void>
+  /** Optional emoji-reaction hook. When set, the streamer adds a
+   *  reaction (`hourglass_flowing_sand` at start, `white_check_mark`
+   *  on success, `warning` on mid-stream failure) so the operator
+   *  gets an at-a-glance signal that a streamed reply is in flight
+   *  / done / interrupted without reading the journal. Optional and
+   *  fire-and-forget — failures here never abort the stream. */
+  addReaction?: (args: { channel: string; ts: string; name: string }) => Promise<void>
 }
 
 /** Configuration for one stream. `channel` + `text` are required;
@@ -248,6 +255,15 @@ export async function streamReply(
   let chunksSent = 1
   let cumulative = chunks[0]!
 
+  // Mark "stream in flight" so the operator can spot ongoing streams
+  // at a glance. Fire-and-forget — a failed reaction must not abort
+  // the stream itself.
+  if (deps.addReaction) {
+    deps.addReaction({ channel: opts.channel, ts, name: 'hourglass_flowing_sand' }).catch(
+      (err) => console.error('[slack] stream addReaction(hourglass) failed', err),
+    )
+  }
+
   // Step 6: progressive update. Each update carries the running
   // total — Slack's chat.update semantic is "replace the message
   // body" so we always send everything-so-far.
@@ -263,6 +279,25 @@ export async function streamReply(
       chunksSent += 1
     } catch (err) {
       const reason = err instanceof Error ? err.message : String(err)
+      // Best-effort: append a visible "interrupted" suffix so the user
+      // sees that the partial reply is intentionally truncated. Try
+      // updateMessage one more time — if it fails (e.g. the channel
+      // is genuinely revoked), swallow and rely on the reaction +
+      // journal entry instead.
+      try {
+        await deps.updateMessage({
+          channel: opts.channel,
+          ts,
+          text: `${cumulative}\n\n⚠️ stream interrupted — partial reply (${reason})`,
+        })
+      } catch {
+        /* tried, accept partial visibility */
+      }
+      if (deps.addReaction) {
+        deps.addReaction({ channel: opts.channel, ts, name: 'warning' }).catch(
+          (e) => console.error('[slack] stream addReaction(warning) failed', e),
+        )
+      }
       await finalizeJournal(deps, opts, ts, chunksSent, committedHash, 'deny', reason)
       return { kind: 'failed_mid_stream', ts, chunksSent, committedHash, reason }
     }
@@ -280,6 +315,11 @@ export async function streamReply(
   }
 
   await finalizeJournal(deps, opts, ts, chunksSent, committedHash, 'allow')
+  if (deps.addReaction) {
+    deps.addReaction({ channel: opts.channel, ts, name: 'white_check_mark' }).catch(
+      (err) => console.error('[slack] stream addReaction(check) failed', err),
+    )
+  }
   return { kind: 'completed', ts, chunksSent, committedHash }
 }
 

@@ -1091,6 +1091,14 @@ async function executeReplyStreamingPath(opts: {
       // primitive; it doesn't know the calling tool's name).
       journalWrite: async (input) => ctx.journalWrite({ ...input, toolName: 'reply' }),
       sleep: (ms) => new Promise<void>((resolve) => setTimeout(resolve, ms)),
+      // Visual progress markers on the streamed message itself: ⏳ at
+      // start, ✅ at success, ⚠️ on mid-stream failure. Lets operators
+      // spot in-flight / done / interrupted streams without opening
+      // the journal. Fire-and-forget — a failed reactions.add never
+      // propagates back to streamReply (it's wrapped in .catch there).
+      addReaction: async (a) => {
+        await ctx.web.reactions.add({ channel: a.channel, timestamp: a.ts, name: a.name })
+      },
     },
   )
   if (result.kind === 'gate_rejected_at_start') {
