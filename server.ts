@@ -2785,6 +2785,21 @@ async function handleMessage(event: unknown): Promise<void> {
         },
         ...(result.dropReason !== undefined ? { reason: result.dropReason } : {}),
       })
+      // Optional canned breadcrumb for DMs from non-allowlisted users.
+      // The drop already prevented MCP delivery (zero tokens consumed);
+      // this just posts a friendly redirect from the plugin directly.
+      if (result.cannedReply) {
+        try {
+          await web.chat.postMessage({
+            channel: ev.channel as string,
+            text: result.cannedReply,
+            unfurl_links: false,
+            unfurl_media: false,
+          })
+        } catch (err) {
+          console.error('[slack] cannedReply chat.postMessage failed', err)
+        }
+      }
       return
     }
 

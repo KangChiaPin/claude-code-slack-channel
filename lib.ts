@@ -93,6 +93,13 @@ export interface Access {
   channels: Record<string, ChannelPolicy>
   pending: Record<string, PendingEntry>
   ackReaction?: string
+  /** Canned text reply for DMs from users not in `allowFrom` while
+   *  `dmPolicy` is 'allowlist'. When set, the gate still drops the
+   *  inbound (no MCP forward, zero Claude tokens) but tells the
+   *  server to chat.postMessage this string back to the sender so
+   *  they get *some* signal rather than silence. Missing/empty =
+   *  preserve the original silent-drop behaviour. */
+  deniedDmReply?: string
   textChunkLimit?: number
   chunkMode?: 'length' | 'newline'
   /** Optional array of declarative policy rules, consumed by the
@@ -126,6 +133,11 @@ export interface GateResult {
   /** Reason a drop occurred, when structured enough to surface in the
    *  journal. Absent on generic drops (self-echo, allowlist miss). */
   dropReason?: GateDropReason
+  /** Canned text the server should post back when action='drop' for a
+   *  DM from a non-allowlisted user. Populated by `handleDmEvent` from
+   *  `access.deniedDmReply` when set. The gate still drops the event
+   *  for delivery — this field just exits the silent-drop default. */
+  cannedReply?: string
 }
 
 /** Identity of a thread-scoped session. See 000-docs/session-state-machine.md.
@@ -1250,6 +1262,11 @@ async function handleDmEvent(ev: Record<string, unknown>, opts: GateOptions): Pr
     return { action: 'deliver', access }
   }
   if (access.dmPolicy === 'allowlist' || access.dmPolicy === 'disabled') {
+    // Optional canned reply lets operators give non-allowlisted users a
+    // breadcrumb ("DM the wrong place, @-mention me in #foo") without
+    // forwarding to MCP. Still a drop — no Claude tokens consumed.
+    const cannedReply = access.deniedDmReply?.trim()
+    if (cannedReply) return { action: 'drop', cannedReply }
     return { action: 'drop' }
   }
 
