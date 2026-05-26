@@ -817,6 +817,46 @@ const DownloadAttachmentInput = z
   })
   .strict()
 
+// reply_with_choices — Block Kit interactive buttons for owner/contributor
+// decisions. Distinct from `reply` because (1) the message is structured
+// (section + actions blocks, not free text), (2) the response comes back
+// asynchronously as a click → MCP notification, not as a return value.
+//
+// callback_id: short tag the agent picks to identify *which* question
+// this answers, in case multiple are pending in the same channel. Reuses
+// the [A-Za-z0-9_-]+ socket-name alphabet for grep-friendliness.
+//
+// choices: 1-5 buttons. Slack actions block limit is 5 elements; we
+// enforce it here so the agent doesn't trip the API. Each label is
+// what the human sees; each value is the opaque token that comes back
+// in the callback notification's meta.
+const ReplyWithChoicesInput = z
+  .object({
+    chat_id: z.string().min(1),
+    thread_ts: z.string().optional(),
+    text: z.string().min(1).max(3000),
+    callback_id: z
+      .string()
+      .min(1)
+      .max(64)
+      .regex(/^[A-Za-z0-9_-]+$/, 'callback_id must match [A-Za-z0-9_-]+'),
+    choices: z
+      .array(
+        z.object({
+          label: z.string().min(1).max(75), // Slack button text limit
+          value: z
+            .string()
+            .min(1)
+            .max(128)
+            .regex(/^[A-Za-z0-9_:.-]+$/, 'value must match [A-Za-z0-9_:.-]+'),
+          style: z.enum(['primary', 'danger']).optional(),
+        }),
+      )
+      .min(1)
+      .max(5),
+  })
+  .strict()
+
 const ListSessionsInput = z.object({}).strict()
 
 const ReadPeerManifestsInput = z
@@ -856,6 +896,7 @@ export const toolSchemas = {
   edit_message: EditMessageInput,
   fetch_messages: FetchMessagesInput,
   fetch_user_dms: FetchUserDmsInput,
+  reply_with_choices: ReplyWithChoicesInput,
   download_attachment: DownloadAttachmentInput,
   list_sessions: ListSessionsInput,
   read_peer_manifests: ReadPeerManifestsInput,
@@ -932,6 +973,53 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
           },
         },
         required: ['channel'],
+      },
+    },
+    {
+      name: 'reply_with_choices',
+      description:
+        "Post an interactive message with Block Kit buttons. Use when you need an owner / contributor to make a discrete decision (yes/no, pick one option, approve/reject) — the buttons keep the answer on-topic and structured. The clicker's choice comes back asynchronously as an MCP notification with meta.callback_data = the value of the pressed button + meta.callback_id = the tag you supplied. Once a button is pressed, the message is updated to remove the buttons and append 'Selected: <label>' so duplicates aren't possible. 1-5 choices per call. Use `style: 'primary'` for the recommended/safe option and `'danger'` for destructive picks; omit for neutral.",
+      inputSchema: {
+        type: 'object' as const,
+        properties: {
+          chat_id: { type: 'string', description: 'Channel or DM ID' },
+          thread_ts: {
+            type: 'string',
+            description: 'Optional thread to reply within',
+          },
+          text: {
+            type: 'string',
+            description: 'Question text shown above the buttons (markdown OK).',
+          },
+          callback_id: {
+            type: 'string',
+            description:
+              "Short tag (A-Z, a-z, 0-9, _ -) you'll receive back in the notification meta to identify which question this answers. Pick something narrow like 'approve-pending-2026-05-26' or 'topic-rename-confirm'.",
+          },
+          choices: {
+            type: 'array',
+            minItems: 1,
+            maxItems: 5,
+            items: {
+              type: 'object',
+              properties: {
+                label: { type: 'string', description: 'Button text (max 75 chars)' },
+                value: {
+                  type: 'string',
+                  description:
+                    'Opaque token returned in callback_data on click (max 128 chars, [A-Za-z0-9_:.-])',
+                },
+                style: {
+                  type: 'string',
+                  enum: ['primary', 'danger'],
+                  description: 'Optional visual style',
+                },
+              },
+              required: ['label', 'value'],
+            },
+          },
+        },
+        required: ['chat_id', 'text', 'callback_id', 'choices'],
       },
     },
     {
@@ -1517,6 +1605,211 @@ async function executeFetchUserDms(
 }
 
 // -----------------------------------------------------------------------
+// reply_with_choices — Block Kit interactive buttons for owner decisions
+//
+// Sends a Block Kit message with a section (the question text) + an
+// actions block (1-5 buttons). When clicked, the existing
+// socket.on('interactive') handler routes the click back to Claude via
+// an MCP notification with meta.callback_data + meta.callback_id.
+//
+// We track posted (channel, ts) → callback_id in `choiceMessages` so
+// the click handler can:
+//   1. Verify the click target was a choice we posted (defense against
+//      spoofed payloads from other workspaces / replays).
+//   2. Update the message via chat.update on click to swap out the
+//      buttons for "✓ Selected: <label> · <@user>", preventing repeat
+//      clicks and giving everyone in the channel a record of the decision.
+// -----------------------------------------------------------------------
+interface ChoiceMessageRecord {
+  callbackId: string
+  choices: Array<{ label: string; value: string }>
+  threadTs: string | undefined
+  text: string
+  postedAt: number
+}
+const choiceMessages = new Map<string, ChoiceMessageRecord>() // key = `${channel}:${ts}`
+
+async function executeReplyWithChoices(
+  args: Record<string, any>,
+  ctx: ToolContext,
+): Promise<ToolResult> {
+  const chatId: string = args.chat_id
+  const threadTs: string | undefined = args.thread_ts
+  const text: string = args.text
+  const callbackId: string = args.callback_id
+  const choices: Array<{ label: string; value: string; style?: 'primary' | 'danger' }> =
+    args.choices
+
+  try {
+    ctx.assertOutboundAllowed(chatId, threadTs)
+  } catch (outboundErr) {
+    ctx.journalWrite({
+      kind: 'gate.outbound.deny',
+      outcome: 'deny',
+      toolName: 'reply_with_choices',
+      sessionKey: threadTs !== undefined ? { channel: chatId, thread: threadTs } : undefined,
+      input: { channel: chatId, thread_ts: threadTs, callback_id: callbackId },
+      reason: outboundErr instanceof Error ? outboundErr.message : String(outboundErr),
+    })
+    throw outboundErr
+  }
+
+  ctx.journalWrite({
+    kind: 'gate.outbound.allow',
+    outcome: 'allow',
+    toolName: 'reply_with_choices',
+    sessionKey: threadTs !== undefined ? { channel: chatId, thread: threadTs } : undefined,
+    input: {
+      channel: chatId,
+      thread_ts: threadTs,
+      callback_id: callbackId,
+      choice_count: choices.length,
+    },
+  })
+
+  const blocks: any[] = [
+    { type: 'section', text: { type: 'mrkdwn', text } },
+    {
+      type: 'actions',
+      block_id: callbackId,
+      elements: choices.map((c) => ({
+        type: 'button',
+        text: { type: 'plain_text', text: c.label, emoji: true },
+        // action_id pattern `choice:<callback_id>:<value>` so the
+        // interactive handler can dispatch without an additional lookup
+        // round-trip. callback_id and value are pre-validated against
+        // [A-Za-z0-9_:.-] / [A-Za-z0-9_-]+ so : is a safe separator.
+        action_id: `choice:${callbackId}:${c.value}`,
+        value: c.value,
+        ...(c.style ? { style: c.style } : {}),
+      })),
+    },
+  ]
+
+  const postArgs: any = { channel: chatId, text, blocks, unfurl_links: false, unfurl_media: false }
+  if (threadTs) postArgs.thread_ts = threadTs
+  const res = await ctx.web.chat.postMessage(postArgs)
+  const ts = res.ts as string | undefined
+  if (!ts) throw new Error('reply_with_choices: chat.postMessage returned no ts')
+
+  choiceMessages.set(`${chatId}:${ts}`, {
+    callbackId,
+    choices: choices.map(({ label, value }) => ({ label, value })),
+    threadTs,
+    text,
+    postedAt: Date.now(),
+  })
+
+  return {
+    content: [
+      {
+        type: 'text',
+        text: JSON.stringify({ ts, callback_id: callbackId, choice_count: choices.length }),
+      },
+    ],
+  }
+}
+
+// Handle a click on a reply_with_choices button. Called from inside the
+// existing socket.on('interactive') handler — distinct from the
+// permission-prompt verbs (perm:allow / perm:deny / perm:more) which
+// have their own routing.
+async function handleChoiceClick(
+  callbackId: string,
+  value: string,
+  channelId: string,
+  messageTs: string,
+  userId: string,
+  threadTs: string | undefined,
+): Promise<void> {
+  const key = `${channelId}:${messageTs}`
+  const record = choiceMessages.get(key)
+  if (!record) {
+    // Either a stale click after restart (in-memory map is empty), a
+    // spoof, or someone re-clicked a message we already finalized.
+    // Log and ack silently — Slack already handled the interaction
+    // ack at the socket layer.
+    console.error('[slack] choice click for unknown message', { channelId, messageTs, callbackId })
+    return
+  }
+  if (record.callbackId !== callbackId) {
+    // action_id was crafted with a callback_id that doesn't match what
+    // we posted. Defense against the agent shipping inconsistent
+    // action_ids (or an adversarial click trying to mismatch).
+    console.error('[slack] choice callback_id mismatch — dropping', {
+      expected: record.callbackId,
+      got: callbackId,
+    })
+    return
+  }
+  const choice = record.choices.find((c) => c.value === value)
+  if (!choice) {
+    console.error('[slack] choice click value not in original options', { callbackId, value })
+    return
+  }
+
+  // Update the original message: drop the actions block, append a
+  // "✓ Selected: <label> · <@user>" footer so the choice is preserved
+  // for everyone in the channel and the buttons can't be re-pressed.
+  const userName = await resolveUserName(userId)
+  const updatedText = `${record.text}\n\n✓ Selected: *${choice.label}* · <@${userId}> (${userName})`
+  try {
+    await web.chat.update({
+      channel: channelId,
+      ts: messageTs,
+      text: updatedText,
+      blocks: [{ type: 'section', text: { type: 'mrkdwn', text: updatedText } }],
+    })
+  } catch (err) {
+    console.error('[slack] choice click chat.update failed', err)
+    /* non-critical — the notification still goes through */
+  }
+
+  choiceMessages.delete(key) // one-shot
+
+  // Forward the click to Claude as a channel notification carrying
+  // callback_data and callback_id in meta. Reuses the same notification
+  // method as inbound messages so the agent's CLAUDE.md only needs
+  // one entry-point ("when you see a <channel> tag, check for
+  // callback_data — if set, it's a button click reply").
+  const userIdSafe = /^[A-Z0-9]{1,32}$/.test(userId) ? userId : 'invalid'
+  const meta: Record<string, string> = {
+    chat_id: channelId,
+    message_id: messageTs,
+    user_id: userIdSafe,
+    user: userName,
+    ts: messageTs,
+    callback_data: value,
+    callback_id: callbackId,
+    callback_label: choice.label,
+  }
+  if (threadTs) meta.thread_ts = threadTs
+
+  if (ROLE_HOOK_ENABLED) {
+    const role = deriveRoleForSender(userIdSafe, OWNER_USER_ID)
+    meta.role = role
+    writeRoleHookFileAtomic(ROLE_HOOK_FILE, role)
+  }
+
+  journalWrite({
+    kind: 'gate.inbound.deliver',
+    outcome: 'allow',
+    actor: 'session_owner',
+    input: {
+      channel: channelId,
+      user: userId,
+      callback_id: callbackId,
+      callback_value: value,
+    },
+  })
+
+  mcp.notification({
+    method: 'notifications/claude/channel',
+    params: { content: `[button_pressed: ${choice.label}]`, meta },
+  })
+}
+
+// -----------------------------------------------------------------------
 // download_attachment
 // -----------------------------------------------------------------------
 async function executeDownloadAttachment(
@@ -1965,6 +2258,7 @@ const toolHandlers: Record<string, ToolHandler> = {
   edit_message: executeEditMessage,
   fetch_messages: executeFetchMessages,
   fetch_user_dms: executeFetchUserDms,
+  reply_with_choices: executeReplyWithChoices,
   download_attachment: executeDownloadAttachment,
   list_sessions: executeListSessions,
   read_peer_manifests: executeReadPeerManifests,
@@ -2585,6 +2879,34 @@ socket.on('interactive', async ({ body, ack }: { body: any; ack: () => Promise<v
 
     const action = body.actions[0]
     const actionId: string = action.action_id || ''
+
+    // Block Kit click from reply_with_choices: routed through the same
+    // socket.on('interactive') handler to keep all Slack interactions in
+    // one place, but the verb namespace is distinct from perm:*.
+    //
+    // action_id pattern: `choice:<callback_id>:<value>` — callback_id is
+    // [A-Za-z0-9_-]+ and value is [A-Za-z0-9_:.-]+ (enforced at tool
+    // invocation by the Zod schema). We match the prefix then split off
+    // value at the last colon so values containing colons (e.g.
+    // "linepay:sell_all") round-trip cleanly.
+    const choiceMatch = actionId.match(/^choice:([A-Za-z0-9_-]+):(.+)$/)
+    if (choiceMatch) {
+      const [, callbackId, value] = choiceMatch
+      const channelId: string = body.channel?.id || ''
+      const messageTs: string = body.message?.ts || ''
+      const choiceThreadTs: string | undefined =
+        (body.message?.thread_ts as string | undefined) || undefined
+      await handleChoiceClick(
+        callbackId,
+        value,
+        channelId,
+        messageTs,
+        body.user?.id || '',
+        choiceThreadTs,
+      )
+      return
+    }
+
     const match = actionId.match(/^perm:(allow|deny|more):(.+)$/)
     if (!match) return
 
