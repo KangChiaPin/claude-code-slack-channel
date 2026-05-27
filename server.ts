@@ -833,6 +833,18 @@ const FetchUserConversationInput = z
   })
   .strict()
 
+// list_user_conversations — enumerate every conversation the owner's
+// xoxp- token can see (public/private channels, DMs, group DMs), so
+// the agent can drive a "read everything since <date>" sweep by
+// looping fetch_user_conversation over the result. Gated by
+// userReadAllowAll. types defaults to all four kinds.
+const ListUserConversationsInput = z
+  .object({
+    types: z.string().optional(), // comma list: public_channel,private_channel,mpim,im
+    limit: z.number().int().positive().max(1000).optional(),
+  })
+  .strict()
+
 // reply_with_choices — Block Kit interactive buttons for owner/contributor
 // decisions. Distinct from `reply` because (1) the message is structured
 // (section + actions blocks, not free text), (2) the response comes back
@@ -913,6 +925,7 @@ export const toolSchemas = {
   fetch_messages: FetchMessagesInput,
   fetch_user_dms: FetchUserDmsInput,
   fetch_user_conversation: FetchUserConversationInput,
+  list_user_conversations: ListUserConversationsInput,
   reply_with_choices: ReplyWithChoicesInput,
   download_attachment: DownloadAttachmentInput,
   list_sessions: ListSessionsInput,
@@ -1037,6 +1050,22 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
           },
         },
         required: ['chat_id', 'text', 'callback_id', 'choices'],
+      },
+    },
+    {
+      name: 'list_user_conversations',
+      description:
+        "Enumerate the conversations the owner's user OAuth token (xoxp-) can see — public/private channels, DMs, group DMs. Only available when access.userReadAllowAll is true. Use this to drive a 'read everything since <date>' sweep: list_user_conversations, then loop fetch_user_conversation over the returned ids with an oldest bound. Returns id, name (or DM counterpart), type, is_member. Mind the volume — a full account can be dozens of conversations; confirm scope with the owner before sweeping all of them.",
+      inputSchema: {
+        type: 'object' as const,
+        properties: {
+          types: {
+            type: 'string',
+            description:
+              "Comma-separated conversation types to list. Default: 'public_channel,private_channel,mpim,im'.",
+          },
+          limit: { type: 'number', description: 'Max conversations (default 200, hard cap 1000).' },
+        },
       },
     },
     {
@@ -1720,6 +1749,69 @@ async function executeFetchUserConversation(
 }
 
 // -----------------------------------------------------------------------
+// list_user_conversations — enumerate owner-visible conversations
+//
+// Broad-read companion to fetch_user_conversation: returns the ids the
+// agent can then sweep. Gated by userReadAllowAll. Does NOT return
+// message content — just the conversation inventory.
+// -----------------------------------------------------------------------
+async function executeListUserConversations(
+  args: Record<string, any>,
+  ctx: ToolContext,
+): Promise<ToolResult> {
+  const types: string = args.types || 'public_channel,private_channel,mpim,im'
+  const limit = Math.min(args.limit || 200, 1000)
+
+  if (!userClient) {
+    ctx.journalWrite({
+      kind: 'gate.user_token.deny',
+      outcome: 'deny',
+      toolName: 'list_user_conversations',
+      input: { types },
+      reason: 'SLACK_USER_TOKEN not configured on this host',
+    })
+    throw new Error('list_user_conversations refused: SLACK_USER_TOKEN not configured')
+  }
+  const access = ctx.getAccess()
+  if (access.userReadAllowAll !== true) {
+    ctx.journalWrite({
+      kind: 'gate.user_token.deny',
+      outcome: 'deny',
+      toolName: 'list_user_conversations',
+      input: { types },
+      reason: 'access.userReadAllowAll is not true (broad-read disabled)',
+    })
+    throw new Error(
+      'list_user_conversations refused: access.userReadAllowAll is not enabled on this topic',
+    )
+  }
+
+  const res = await userClient.conversations.list({
+    types,
+    limit,
+    exclude_archived: true,
+  })
+  const channels = (res.channels || []).map((c: any) => ({
+    id: c.id,
+    name: c.name || (c.is_im ? `DM:${c.user}` : c.is_mpim ? 'group-dm' : '(unnamed)'),
+    type: c.is_im ? 'im' : c.is_mpim ? 'mpim' : c.is_private ? 'private_channel' : 'public_channel',
+    is_member: c.is_member ?? undefined,
+    user: c.user, // present for DMs
+  }))
+
+  ctx.journalWrite({
+    kind: 'gate.user_token.read',
+    outcome: 'allow',
+    toolName: 'list_user_conversations',
+    input: { types, conversation_count: channels.length },
+  })
+
+  return {
+    content: [{ type: 'text', text: JSON.stringify(channels, null, 2) }],
+  }
+}
+
+// -----------------------------------------------------------------------
 // reply_with_choices — Block Kit interactive buttons for owner decisions
 //
 // Sends a Block Kit message with a section (the question text) + an
@@ -2374,6 +2466,7 @@ const toolHandlers: Record<string, ToolHandler> = {
   fetch_messages: executeFetchMessages,
   fetch_user_dms: executeFetchUserDms,
   fetch_user_conversation: executeFetchUserConversation,
+  list_user_conversations: executeListUserConversations,
   reply_with_choices: executeReplyWithChoices,
   download_attachment: executeDownloadAttachment,
   list_sessions: executeListSessions,
