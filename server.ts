@@ -1340,7 +1340,15 @@ async function executeReply(args: Record<string, any>, ctx: ToolContext): Promis
   const text: string = args.text
   const threadTs: string | undefined = args.thread_ts
   const files: string[] | undefined = args.files
-  const stream: boolean = args.stream === true
+  // Fork default: streaming ON unless the caller explicitly opts out
+  // with stream:false. Upstream defaults this off (opt-in), but agents
+  // reliably forget to pass stream:true — they pattern-match their own
+  // prior non-streaming reply calls over the CLAUDE.md instruction. The
+  // streaming path is a no-op for replies under the chunk limit anyway
+  // (single chat.postMessage), so defaulting on costs nothing for short
+  // replies and gives progressive reveal for long ones without relying
+  // on the model to remember.
+  const stream: boolean = args.stream !== false
 
   try {
     ctx.assertOutboundAllowed(chatId, threadTs)
