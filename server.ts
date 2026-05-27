@@ -817,6 +817,22 @@ const DownloadAttachmentInput = z
   })
   .strict()
 
+// fetch_user_conversation — read ANY conversation (channel / DM / group
+// DM) the owner's xoxp- token can reach, by channel_id. Gated ONLY by
+// access.userReadAllowAll (the broad-read escape hatch), NOT by the
+// per-user DM allowlist — this is the "see everything the owner sees"
+// path. channel_id regex allows C (public/private channel), D (DM),
+// G (legacy group / mpim) prefixes.
+const FetchUserConversationInput = z
+  .object({
+    channel_id: z
+      .string()
+      .regex(/^[CDG][A-Z0-9]{2,}$/, 'channel_id must be a Slack conversation id (C.../D.../G...)'),
+    limit: z.number().int().positive().max(200).optional(),
+    oldest: z.string().optional(),
+  })
+  .strict()
+
 // reply_with_choices — Block Kit interactive buttons for owner/contributor
 // decisions. Distinct from `reply` because (1) the message is structured
 // (section + actions blocks, not free text), (2) the response comes back
@@ -896,6 +912,7 @@ export const toolSchemas = {
   edit_message: EditMessageInput,
   fetch_messages: FetchMessagesInput,
   fetch_user_dms: FetchUserDmsInput,
+  fetch_user_conversation: FetchUserConversationInput,
   reply_with_choices: ReplyWithChoicesInput,
   download_attachment: DownloadAttachmentInput,
   list_sessions: ListSessionsInput,
@@ -1023,9 +1040,26 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
       },
     },
     {
+      name: 'fetch_user_conversation',
+      description:
+        "Read history of ANY conversation (public/private channel, DM, or group DM) the owner can see, by channel_id, using the owner's user OAuth token (xoxp-). Only available when access.userReadAllowAll is true (the broad-read posture) — refuses otherwise. This is the 'see everything the owner sees' path; prefer fetch_user_dms for the narrow per-user DM case. Every call is journaled (gate.user_token.read). Read for answering; do not export contents to memory without owner approval.",
+      inputSchema: {
+        type: 'object' as const,
+        properties: {
+          channel_id: {
+            type: 'string',
+            description: 'Slack conversation id: C... (channel), D... (DM), G... (group DM).',
+          },
+          limit: { type: 'number', description: 'Max messages (default 50, hard cap 200).' },
+          oldest: { type: 'string', description: 'Optional Slack ts lower bound.' },
+        },
+        required: ['channel_id'],
+      },
+    },
+    {
       name: 'fetch_user_dms',
       description:
-        "Fetch DM history with a specific user, using the owner's user OAuth token (xoxp-). Refuses when SLACK_USER_TOKEN is not configured OR target_user_id is not in access.userDmAllowlist. Use sparingly — every call is journaled and counts as the owner reading the conversation. Never call this without a topic-relevance reason; do not export the resulting messages to memory without owner approval.",
+        "Fetch DM history with a specific user, using the owner's user OAuth token (xoxp-). Refuses when SLACK_USER_TOKEN is not configured OR (target_user_id is not in access.userDmAllowlist AND access.userReadAllowAll is not true). Use sparingly — every call is journaled and counts as the owner reading the conversation. Never call this without a topic-relevance reason; do not export the resulting messages to memory without owner approval.",
       inputSchema: {
         type: 'object' as const,
         properties: {
@@ -1537,13 +1571,15 @@ async function executeFetchUserDms(
 
   const access = ctx.getAccess()
   const allowlist = access.userDmAllowlist || []
-  if (!allowlist.includes(targetUserId)) {
+  // Broad-read posture (userReadAllowAll) bypasses the per-user
+  // allowlist; otherwise the target must be explicitly listed.
+  if (access.userReadAllowAll !== true && !allowlist.includes(targetUserId)) {
     ctx.journalWrite({
       kind: 'gate.user_token.deny',
       outcome: 'deny',
       toolName: 'fetch_user_dms',
       input: { target_user_id: targetUserId },
-      reason: 'target_user_id not in access.userDmAllowlist',
+      reason: 'target_user_id not in access.userDmAllowlist (and userReadAllowAll not set)',
     })
     throw new Error(`fetch_user_dms refused: ${targetUserId} not in access.userDmAllowlist`)
   }
@@ -1580,6 +1616,85 @@ async function executeFetchUserDms(
       channel: dm.id,
       message_count: messages.length,
     },
+  })
+
+  const formatted = await Promise.all(
+    messages.map(async (m: any) => {
+      const userName = m.user ? await ctx.resolveUserName(m.user) : 'unknown'
+      return {
+        ts: m.ts,
+        user: userName,
+        user_id: m.user,
+        text: m.text,
+        files: m.files?.map((f: any) => ({
+          name: f.name,
+          mimetype: f.mimetype,
+          size: f.size,
+        })),
+      }
+    }),
+  )
+
+  return {
+    content: [{ type: 'text', text: JSON.stringify(formatted, null, 2) }],
+  }
+}
+
+// -----------------------------------------------------------------------
+// fetch_user_conversation — broad-read: any conversation by channel_id
+//
+// Gated solely by access.userReadAllowAll. Reads via the owner's xoxp-
+// token, so it can reach public/private channels + DMs + group DMs the
+// owner is in. Refuses hard when the token is missing OR the broad-read
+// flag isn't set. Every read journals gate.user_token.read; refusals
+// journal gate.user_token.deny.
+// -----------------------------------------------------------------------
+async function executeFetchUserConversation(
+  args: Record<string, any>,
+  ctx: ToolContext,
+): Promise<ToolResult> {
+  const channelId: string = args.channel_id
+  const limit = Math.min(args.limit || 50, 200)
+  const oldest: string | undefined = args.oldest
+
+  if (!userClient) {
+    ctx.journalWrite({
+      kind: 'gate.user_token.deny',
+      outcome: 'deny',
+      toolName: 'fetch_user_conversation',
+      input: { channel: channelId },
+      reason: 'SLACK_USER_TOKEN not configured on this host',
+    })
+    throw new Error('fetch_user_conversation refused: SLACK_USER_TOKEN not configured')
+  }
+
+  const access = ctx.getAccess()
+  if (access.userReadAllowAll !== true) {
+    ctx.journalWrite({
+      kind: 'gate.user_token.deny',
+      outcome: 'deny',
+      toolName: 'fetch_user_conversation',
+      input: { channel: channelId },
+      reason: 'access.userReadAllowAll is not true (broad-read disabled)',
+    })
+    throw new Error(
+      'fetch_user_conversation refused: access.userReadAllowAll is not enabled on this topic',
+    )
+  }
+
+  const histArgs: { channel: string; limit: number; oldest?: string } = {
+    channel: channelId,
+    limit,
+  }
+  if (oldest) histArgs.oldest = oldest
+  const histRes = await userClient.conversations.history(histArgs)
+  const messages = (histRes.messages || []).reverse() // oldest-first
+
+  ctx.journalWrite({
+    kind: 'gate.user_token.read',
+    outcome: 'allow',
+    toolName: 'fetch_user_conversation',
+    input: { channel: channelId, message_count: messages.length },
   })
 
   const formatted = await Promise.all(
@@ -2258,6 +2373,7 @@ const toolHandlers: Record<string, ToolHandler> = {
   edit_message: executeEditMessage,
   fetch_messages: executeFetchMessages,
   fetch_user_dms: executeFetchUserDms,
+  fetch_user_conversation: executeFetchUserConversation,
   reply_with_choices: executeReplyWithChoices,
   download_attachment: executeDownloadAttachment,
   list_sessions: executeListSessions,

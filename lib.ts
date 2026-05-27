@@ -110,6 +110,17 @@ export interface Access {
    *  itself is unset, so this field only matters in deployments
    *  that opted into the user-token path. */
   userDmAllowlist?: string[]
+  /** Broad-read escape hatch: when true, fetch_user_dms +
+   *  fetch_user_conversation may read ANY conversation the owner's
+   *  xoxp- token can reach (all DMs, group DMs, public + private
+   *  channels the owner is in) — the per-user `userDmAllowlist`
+   *  narrowing is bypassed. This is the maximal user-token posture:
+   *  the topic agent sees everything the owner sees in Slack. Only
+   *  enable on topics the owner fully trusts with their whole Slack
+   *  read surface, and keep CLAUDE.md's "don't persist to memory
+   *  without approval" rule tight. Missing/false = stay narrow
+   *  (allowlist-gated DMs only, no channel reads). */
+  userReadAllowAll?: boolean
   textChunkLimit?: number
   chunkMode?: 'length' | 'newline'
   /** Optional array of declarative policy rules, consumed by the
