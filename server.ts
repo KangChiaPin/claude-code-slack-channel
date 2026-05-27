@@ -1560,6 +1560,16 @@ async function executeFetchMessages(
           mimetype: f.mimetype,
           size: f.size,
         })),
+        // Emoji reactions on the message: name + count + the user_ids
+        // who reacted. Lets the agent see 👍/✅/votes for sentiment +
+        // decision tracking. user_ids stay raw (resolving N names per
+        // reaction would be a lookup storm); the agent can resolve on
+        // demand if it needs display names.
+        reactions: m.reactions?.map((r: any) => ({
+          name: r.name,
+          count: r.count,
+          users: r.users,
+        })),
       }
     }),
   )
@@ -1668,6 +1678,16 @@ async function executeFetchUserDms(
           mimetype: f.mimetype,
           size: f.size,
         })),
+        // Emoji reactions on the message: name + count + the user_ids
+        // who reacted. Lets the agent see 👍/✅/votes for sentiment +
+        // decision tracking. user_ids stay raw (resolving N names per
+        // reaction would be a lookup storm); the agent can resolve on
+        // demand if it needs display names.
+        reactions: m.reactions?.map((r: any) => ({
+          name: r.name,
+          count: r.count,
+          users: r.users,
+        })),
       }
     }),
   )
@@ -1746,6 +1766,16 @@ async function executeFetchUserConversation(
           name: f.name,
           mimetype: f.mimetype,
           size: f.size,
+        })),
+        // Emoji reactions on the message: name + count + the user_ids
+        // who reacted. Lets the agent see 👍/✅/votes for sentiment +
+        // decision tracking. user_ids stay raw (resolving N names per
+        // reaction would be a lookup storm); the agent can resolve on
+        // demand if it needs display names.
+        reactions: m.reactions?.map((r: any) => ({
+          name: r.name,
+          count: r.count,
+          users: r.users,
         })),
       }
     }),
