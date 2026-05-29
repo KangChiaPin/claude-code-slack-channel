@@ -143,6 +143,35 @@ Maximum characters per outbound message. Default: 4000 (Slack's limit).
 ### `chunkMode`
 How to split long messages: `"newline"` (paragraph-aware, default) or `"length"` (fixed character count).
 
+### `deniedDmReply` *(fork-only)*
+Optional canned message returned to a sender whose DM was dropped by the `allowlist` policy. Without it the message is silently swallowed, which looks identical to the bot being offline and confuses well-meaning senders. Example:
+
+```json
+"deniedDmReply": "Hi — this bot is allowlist-only. Ask the operator to add you via /slack-channel:access."
+```
+
+Leave unset for silent-drop behaviour (default).
+
+### `userDmAllowlist` *(fork-only)*
+Array of Slack user IDs whose DM history with the owner the agent is allowed to read via `mcp__slack__fetch_user_dms`. Empty or missing = the tool refuses every read, even when `SLACK_USER_TOKEN` (xoxp-) is set. Reads are journaled as `gate.user_token.read`; refusals as `gate.user_token.deny`.
+
+This is a **narrowing** gate on top of the user token. The token grants the technical ability to read anything the owner can see; the allowlist is what actually gets read.
+
+### `userReadAllowAll` *(fork-only)*
+Boolean. When `true` AND `SLACK_USER_TOKEN` is set, the agent can call `mcp__slack__fetch_user_conversation` (any channel/DM) and `mcp__slack__list_user_conversations` (enumerate). Defaults to `false`. Independent of `userDmAllowlist` — both flags can be set together.
+
+**Use sparingly.** This is the maximal-read posture. The token can read every channel + DM the owner can see; this flag lifts the per-target narrowing. Intended for a personal-assistant topic where the owner accepts the trust model. Combine with a tight `dmPolicy: allowlist` so only the owner can ask the agent to fetch.
+
+### Trust model — user token (xoxp-) *(fork-only)*
+The owner's user OAuth token is loaded from `SLACK_USER_TOKEN` env (typically `.slack-state/.env`). Anyone with this token can act as the owner in Slack — read everything the owner can read, post as the owner. Treat with the same care as SSH private keys:
+
+- `chmod 0o600` on the .env file
+- Only set the token on bots where the owner accepts the trust model
+- Use `userDmAllowlist` (per-target) for low-trust topics; `userReadAllowAll` only for high-trust ones
+- Every read+refusal is journaled — audit with `bun server.ts --verify-audit-log`
+
+The token is never logged at INFO level. `auth.test` is called once at startup to confirm validity; the response is logged at DEBUG only.
+
 ## Security
 
 - File permissions: `0o600` (owner read/write only)
