@@ -152,6 +152,16 @@ Optional canned message returned to a sender whose DM was dropped by the `allowl
 
 Leave unset for silent-drop behaviour (default).
 
+### `deniedDmOwnerPing` *(fork-only)*
+Boolean. When `true`, an unauthorized DM also fires a heads-up DM to the owner (`OWNER_SLACK_USER_ID` env), with the sender's user_id and a 120-char preview of the message. Without it the owner has no signal that someone tried to reach the bot — the only record is in `audit.log` under `gate.dm.deny`, which nobody actually reads. Subject to the same per-sender cooldown as `deniedDmReply`, so a spammer can't flood the owner's DMs. Defaults to `false`.
+
+Requires `OWNER_SLACK_USER_ID` env set; otherwise silently no-op.
+
+### `deniedDmCooldownSec` *(fork-only)*
+Per-sender cooldown for the `deniedDmReply` + `deniedDmOwnerPing` actions, in seconds. Within the window, the same sender repeating a DM still gets dropped at the gate but does NOT trigger the canned reply or owner ping again. Default: `3600` (1h) when unset.
+
+State is in-memory only — a service restart clears the cooldown map, so the next repeat DM after a restart gets one fresh round of canned reply + owner ping. Intentional: persisting cooldown adds disk-write pressure and the gap-after-restart is small enough to ignore.
+
 ### `userDmAllowlist` *(fork-only)*
 Array of Slack user IDs whose DM history with the owner the agent is allowed to read via `mcp__slack__fetch_user_dms`. Empty or missing = the tool refuses every read, even when `SLACK_USER_TOKEN` (xoxp-) is set. Reads are journaled as `gate.user_token.read`; refusals as `gate.user_token.deny`.
 

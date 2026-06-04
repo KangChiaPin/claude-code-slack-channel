@@ -100,6 +100,20 @@ export interface Access {
    *  they get *some* signal rather than silence. Missing/empty =
    *  preserve the original silent-drop behaviour. */
   deniedDmReply?: string
+  /** When true, an unauthorized DM also triggers a heads-up DM to
+   *  the owner (`OWNER_SLACK_USER_ID` env). Without it the owner has
+   *  no way to know someone tried to reach the bot — they have to
+   *  read audit.log, which nobody does. Subject to the per-sender
+   *  cooldown so a spammer can't flood the owner's DMs. Missing /
+   *  false = the original silent-drop-and-canned-reply behaviour. */
+  deniedDmOwnerPing?: boolean
+  /** Per-sender cooldown for the deniedDmReply + deniedDmOwnerPing
+   *  actions, in seconds. The same sender repeating a DM within the
+   *  cooldown window gets no reply and no owner ping (still dropped
+   *  at the gate). Defaults to 3600s (1h) when unset. State is
+   *  in-memory only — service restart clears the cooldown and the
+   *  next repeat DM gets one fresh round. */
+  deniedDmCooldownSec?: number
   /** Allowlist of Slack user_ids whose DMs the fetch_user_dms tool
    *  is permitted to read via the owner's xoxp- user token. The
    *  user token can technically reach every DM the owner can see;

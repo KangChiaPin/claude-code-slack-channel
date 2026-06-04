@@ -176,6 +176,13 @@ const OWNER_USER_ID = process.env.OWNER_SLACK_USER_ID || ''
 const ROLE_HOOK_FILE = process.env.SLACK_ROLE_HOOK_FILE || ''
 const ROLE_HOOK_ENABLED = OWNER_USER_ID !== '' && ROLE_HOOK_FILE !== ''
 
+/** Per-sender cooldown timestamps (ms epoch of last canned-reply / owner-ping
+ *  emission) for the denied-DM flow. Module-scope in-memory state — restart
+ *  clears it; that's intentional to keep state management trivial. The
+ *  cooldown bounds spam from senders who repeatedly DM after being denied. */
+const deniedDmCooldown = new Map<string, number>()
+const DENIED_DM_COOLDOWN_DEFAULT_SEC = 3600
+
 /** Atomically write the resolved role to SLACK_ROLE_HOOK_FILE.
  *
  *  Write to a sibling tmp file then rename so a concurrent reader (the
@@ -3530,19 +3537,45 @@ async function handleMessage(event: unknown): Promise<void> {
         },
         ...(result.dropReason !== undefined ? { reason: result.dropReason } : {}),
       })
-      // Optional canned breadcrumb for DMs from non-allowlisted users.
-      // The drop already prevented MCP delivery (zero tokens consumed);
-      // this just posts a friendly redirect from the plugin directly.
+      // Optional canned breadcrumb + owner ping for DMs from non-allowlisted
+      // users. Drop already prevented MCP delivery (zero tokens consumed);
+      // these run from the plugin directly. Both are throttled by a per-
+      // sender cooldown so a spammer can't flood the sender or the owner.
       if (result.cannedReply) {
-        try {
-          await web.chat.postMessage({
-            channel: ev.channel as string,
-            text: result.cannedReply,
-            unfurl_links: false,
-            unfurl_media: false,
-          })
-        } catch (err) {
-          console.error('[slack] cannedReply chat.postMessage failed', err)
+        const access = getAccess()
+        const senderId = ev.user as string | undefined
+        const cooldownSec = access.deniedDmCooldownSec ?? DENIED_DM_COOLDOWN_DEFAULT_SEC
+        const cooldownMs = cooldownSec * 1000
+        const lastTs = senderId ? (deniedDmCooldown.get(senderId) ?? 0) : 0
+        const withinCooldown = senderId !== undefined && Date.now() - lastTs < cooldownMs
+        if (!withinCooldown) {
+          if (senderId) deniedDmCooldown.set(senderId, Date.now())
+          try {
+            await web.chat.postMessage({
+              channel: ev.channel as string,
+              text: result.cannedReply,
+              unfurl_links: false,
+              unfurl_media: false,
+            })
+          } catch (err) {
+            console.error('[slack] cannedReply chat.postMessage failed', err)
+          }
+          if (access.deniedDmOwnerPing && OWNER_USER_ID && senderId) {
+            const rawText = typeof ev.text === 'string' ? ev.text : ''
+            const preview = rawText.length > 120 ? `${rawText.slice(0, 120)}…` : rawText
+            const previewLine = preview ? `\n> ${preview.replace(/\n/g, ' ')}` : ''
+            const ownerNotice = `📬 Unauthorized DM — <@${senderId}> tried to DM me.${previewLine}\n\nAdd to allowlist (edit .slack-state/access.json) or ignore. Same sender silenced for ${Math.round(cooldownSec / 60)} min.`
+            try {
+              await web.chat.postMessage({
+                channel: OWNER_USER_ID,
+                text: ownerNotice,
+                unfurl_links: false,
+                unfurl_media: false,
+              })
+            } catch (err) {
+              console.error('[slack] deniedDmOwnerPing chat.postMessage failed', err)
+            }
+          }
         }
       }
       return
