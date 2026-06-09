@@ -21,43 +21,82 @@ import {
   AUDIT_RECEIPTS_MAX,
   type AuditReceiptPostArgs,
   type AuditReceiptPostError,
+  allowedSinkFor,
+  assertNoSecretValues,
   assertOutboundAllowed,
   assertSendable,
   buildAndPostAuditReceipt,
   buildAuditReceiptMessage,
+  buildSecretPlaceholderMap,
+  buildSecretValueSet,
   type ChannelPolicy,
   chunkText,
+  classifyDeliveryError,
+  computeBackoffMs,
+  DELIVERY_METADATA_EVENT_TYPE,
+  type DeliveryObligation,
+  declaredSecretNames,
   defaultAccess,
+  deliveryIdempotencyKey,
   detectNewAllowFrom,
   EVENT_DEDUP_TTL_MS,
   enforceAuditReceiptCap,
   escMrkdwn,
+  extractSlackErrorCode,
+  findSecretDeclaration,
   type GateOptions,
   gate,
   generateCode,
   generateCorrelationId,
+  type IdempotentSendDeps,
+  type InFlightTurn,
   isDuplicateEvent,
   isSlackFileUrl,
   loadSession,
   MAX_PAIRING_REPLIES,
   MAX_PENDING,
   MIGRATED_DEFAULT_THREAD,
+  makeIdempotentSend,
   migrateFlatSessions,
+  NON_RETRYABLE_SLACK_ERRORS,
   PAIRING_EXPIRY_MS,
   PERMISSION_REPLY_RE,
   parseSendableRoots,
   pruneExpired,
+  redactSecretValues,
   resolveJournalPath,
+  SECRET_DECLARATIONS,
+  type SecretDeclaration,
+  type SecretSink,
   type Session,
   type SessionKey,
   sanitizeDisplayName,
   sanitizeFilename,
   saveSession,
+  secretNameFromPlaceholder,
+  secretPlaceholder,
   sessionPath,
   shouldPostAuditReceipt,
   validateSendableRoots,
 } from './lib.ts'
-import { createSessionSupervisor } from './supervisor.ts'
+import {
+  createDeliverySendDeps,
+  createReplyPoster,
+  DurableUnavailableError,
+  deliverReplyDurably,
+  type ReplyPoster,
+} from './slack-delivery.ts'
+import {
+  classifyRecovery,
+  createSessionSupervisor,
+  DEFAULT_LEASE_TTL_MS,
+  DEFAULT_MAX_DELIVERY_ATTEMPTS,
+  heartbeatLease,
+  isLeaseStale,
+  type Lease,
+  resolveLeaseTtlMs,
+  type SessionHandle,
+} from './supervisor.ts'
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -623,6 +662,347 @@ describe('gate', () => {
 // The new allowlist-based assertSendable uses realpathSync to follow symlinks,
 // so tests must operate on real files under a temp directory rather than
 // purely-lexical paths.
+
+// ---------------------------------------------------------------------------
+// Secret declarations (ccsc-z0n.1) — one table, three consumers, no drift
+// ---------------------------------------------------------------------------
+
+describe('secret declarations (ccsc-z0n.1)', () => {
+  test('declares the two Slack tokens the runtime loads', () => {
+    const names = SECRET_DECLARATIONS.map((d) => d.name).sort()
+    expect(names).toEqual(['SLACK_APP_TOKEN', 'SLACK_BOT_TOKEN'])
+  })
+
+  test('table is frozen and has no duplicate names', () => {
+    expect(Object.isFrozen(SECRET_DECLARATIONS)).toBe(true)
+    const names = SECRET_DECLARATIONS.map((d) => d.name)
+    expect(new Set(names).size).toBe(names.length)
+  })
+
+  test('every declaration carries a non-empty value prefix and injection point', () => {
+    for (const d of SECRET_DECLARATIONS) {
+      expect(d.valuePrefix.length).toBeGreaterThan(0)
+      expect(d.injectionPoint.length).toBeGreaterThan(0)
+      expect(d.envVar.length).toBeGreaterThan(0)
+    }
+  })
+
+  test('declared value prefixes match the boot-time token shape checks', () => {
+    // server.ts validates xoxb-/xapp- at boot; the table is the source those
+    // prefixes should ultimately derive from. Lock the correspondence here.
+    expect(findSecretDeclaration('SLACK_BOT_TOKEN')?.valuePrefix).toBe('xoxb-')
+    expect(findSecretDeclaration('SLACK_APP_TOKEN')?.valuePrefix).toBe('xapp-')
+  })
+
+  describe('placeholder consumer', () => {
+    test('round-trips name → placeholder → name for every declared secret', () => {
+      for (const d of SECRET_DECLARATIONS) {
+        const ph = secretPlaceholder(d.name)
+        expect(secretNameFromPlaceholder(ph)).toBe(d.name)
+      }
+    })
+
+    test('placeholder never contains the declared live-value prefix', () => {
+      for (const d of SECRET_DECLARATIONS) {
+        expect(secretPlaceholder(d.name)).not.toContain(d.valuePrefix)
+      }
+    })
+
+    test('non-placeholder strings decode to undefined', () => {
+      expect(secretNameFromPlaceholder('xoxb-1-2-realtokenlike')).toBeUndefined()
+      expect(secretNameFromPlaceholder('{{CCSC_SECRET:}}')).toBeUndefined()
+      expect(secretNameFromPlaceholder('SLACK_BOT_TOKEN')).toBeUndefined()
+      expect(secretNameFromPlaceholder('  {{CCSC_SECRET:SLACK_BOT_TOKEN}}  ')).toBeUndefined()
+    })
+  })
+
+  describe('guard consumer', () => {
+    test('watch-set is exactly the declared names — no second list', () => {
+      expect(declaredSecretNames().sort()).toEqual(SECRET_DECLARATIONS.map((d) => d.name).sort())
+    })
+
+    test('buildSecretValueSet collects only resolved declared values', () => {
+      const set = buildSecretValueSet((d) =>
+        d.name === 'SLACK_BOT_TOKEN' ? 'xoxb-live-bot' : 'xapp-live-app',
+      )
+      expect(set.has('xoxb-live-bot')).toBe(true)
+      expect(set.has('xapp-live-app')).toBe(true)
+      expect(set.size).toBe(2)
+    })
+
+    test('buildSecretValueSet skips empty/undefined values', () => {
+      const set = buildSecretValueSet((d) => (d.name === 'SLACK_BOT_TOKEN' ? 'xoxb-live-bot' : ''))
+      expect(set.has('xoxb-live-bot')).toBe(true)
+      expect(set.size).toBe(1)
+
+      const none = buildSecretValueSet(() => undefined)
+      expect(none.size).toBe(0)
+    })
+
+    test('buildSecretValueSet derives from the table, not the resolver keys', () => {
+      // A resolver that also "knows" an undeclared secret must NOT leak it into
+      // the guard set — the set is keyed by the declaration table only.
+      const set = buildSecretValueSet((d) => `value-for-${d.name}`)
+      expect([...set]).not.toContain('value-for-UNDECLARED_SECRET')
+      expect(set.size).toBe(SECRET_DECLARATIONS.length)
+    })
+
+    test('buildSecretValueSet collapses duplicate values', () => {
+      const set = buildSecretValueSet(() => 'same-value-everywhere')
+      expect(set.size).toBe(1)
+    })
+  })
+
+  describe('routing consumer', () => {
+    test('allowedSinkFor returns the declared sink for each secret', () => {
+      expect(allowedSinkFor('SLACK_BOT_TOKEN')).toBe('slack-web-api')
+      expect(allowedSinkFor('SLACK_APP_TOKEN')).toBe('slack-socket-api')
+    })
+
+    test('allowedSinkFor returns undefined for an undeclared name', () => {
+      expect(allowedSinkFor('SLACK_NOT_A_TOKEN')).toBeUndefined()
+    })
+
+    test('every declared sink is a valid SecretSink', () => {
+      const valid: SecretSink[] = ['slack-web-api', 'slack-socket-api', 'none']
+      for (const d of SECRET_DECLARATIONS) {
+        expect(valid).toContain(d.allowedSink)
+      }
+    })
+  })
+
+  test('all three consumers derive from the same declaration (no drift)', () => {
+    // The core declaration-as-enforcement property: for every row in the one
+    // table, the placeholder, the guard watch-set, and the routing rule are all
+    // keyed on that row's `name` — there is no fourth place a secret is defined.
+    const guardNames = new Set(declaredSecretNames())
+    for (const d of SECRET_DECLARATIONS) {
+      // placeholder consumer
+      expect(secretNameFromPlaceholder(secretPlaceholder(d.name))).toBe(d.name)
+      // guard consumer
+      expect(guardNames.has(d.name)).toBe(true)
+      // routing consumer
+      expect(allowedSinkFor(d.name)).toBe(d.allowedSink)
+    }
+  })
+
+  test('SecretDeclaration shape is structurally enforced at compile time', () => {
+    // Type-level assertion (compiled by tsc --noEmit): a declaration assembled
+    // from the public type must match a table row by value.
+    const sample: SecretDeclaration = SECRET_DECLARATIONS[0]!
+    expect(sample.name).toBe('SLACK_BOT_TOKEN')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// assertNoSecretValues (ccsc-z0n.3) — value-exfiltration guard
+// ---------------------------------------------------------------------------
+
+describe('assertNoSecretValues (ccsc-z0n.3)', () => {
+  // Sentinel stand-in values, NOT real token shapes. The guard does pure
+  // substring matching (it is value-agnostic), so the test exercises identical
+  // logic without embedding `xoxb-`/`xapp-`-shaped strings that would (a) trip
+  // GitHub push protection and (b) violate the repo's no-token-fixtures rule.
+  // The real token *shapes* are validated separately in the schema tests above.
+  const BOT = 'CCSC-TEST-BOT-SECRET-value-not-a-real-token'
+  const APP = 'CCSC-TEST-APP-SECRET-value-not-a-real-token'
+  const secrets = new Set([BOT, APP])
+  const BLOCK_MSG = 'Blocked: outbound payload contains a declared secret value'
+
+  test('throws when the payload IS a secret value', () => {
+    expect(() => assertNoSecretValues(BOT, secrets)).toThrow(BLOCK_MSG)
+  })
+
+  test('detects a secret value anywhere in the payload (start / middle / end)', () => {
+    expect(() => assertNoSecretValues(`${BOT} trailing text`, secrets)).toThrow(BLOCK_MSG)
+    expect(() => assertNoSecretValues(`leading ${BOT} trailing`, secrets)).toThrow(BLOCK_MSG)
+    expect(() => assertNoSecretValues(`text then ${APP}`, secrets)).toThrow(BLOCK_MSG)
+  })
+
+  // The three wired call sites in server.ts all reduce to "string contains
+  // value" at the guard — the guard is content-agnostic; the wiring chooses
+  // which strings to scan (reply/edit text, file body, attachment filename).
+  test('blocks the value embedded in message text', () => {
+    expect(() => assertNoSecretValues(`here is the token: ${BOT}, oops`, secrets)).toThrow(
+      BLOCK_MSG,
+    )
+  })
+
+  test('blocks the value embedded in a file body', () => {
+    const fileBody = `# config\nSLACK_BOT_TOKEN=${BOT}\nDEBUG=true\n`
+    expect(() => assertNoSecretValues(fileBody, secrets)).toThrow(BLOCK_MSG)
+  })
+
+  test('blocks the value smuggled into an attachment filename', () => {
+    expect(() => assertNoSecretValues(`leak-${APP}.txt`, secrets)).toThrow(BLOCK_MSG)
+  })
+
+  test('the error message never echoes the matched value or the payload', () => {
+    try {
+      assertNoSecretValues(`secret is ${BOT} do not log`, secrets)
+      throw new Error('expected assertNoSecretValues to throw')
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e)
+      expect(msg).toBe(BLOCK_MSG)
+      expect(msg).not.toContain(BOT)
+      expect(msg).not.toContain('do not log')
+    }
+  })
+
+  test('allows a clean payload that contains no secret value', () => {
+    expect(() => assertNoSecretValues('a perfectly ordinary reply', secrets)).not.toThrow()
+    // A near-miss (a strict prefix of the value, not the whole value) must NOT
+    // trip the guard — only the full secret value matches.
+    expect(() => assertNoSecretValues('CCSC-TEST-BOT-SECRET only', secrets)).not.toThrow()
+  })
+
+  test('empty value set is a no-op even for token-shaped text', () => {
+    expect(() => assertNoSecretValues(BOT, new Set())).not.toThrow()
+  })
+
+  test('empty / non-string payloads are no-ops', () => {
+    expect(() => assertNoSecretValues('', secrets)).not.toThrow()
+    // Defensive: a non-string slipping through must not throw a TypeError.
+    expect(() => assertNoSecretValues(undefined as unknown as string, secrets)).not.toThrow()
+    expect(() => assertNoSecretValues(null as unknown as string, secrets)).not.toThrow()
+  })
+
+  test('blocks if ANY one of several declared values is present', () => {
+    expect(() => assertNoSecretValues(`only the app token ${APP} here`, secrets)).toThrow(BLOCK_MSG)
+  })
+
+  test('an empty-string entry in the set never matches', () => {
+    // buildSecretValueSet skips empty values, but guard must be robust anyway:
+    // an empty string is a substring of every payload and must NOT trip it.
+    const withEmpty = new Set(['', BOT])
+    expect(() => assertNoSecretValues('clean text', withEmpty)).not.toThrow()
+    expect(() => assertNoSecretValues(BOT, withEmpty)).toThrow(BLOCK_MSG)
+  })
+
+  test('seam: buildSecretValueSet drives the guard end-to-end (ccsc-z0n.1 → .3)', () => {
+    // Mirror how server.ts builds the set: resolve each declaration to a live
+    // value, then guard against it. Proves the guard's watch-set comes from the
+    // declaration table, not a hand-maintained list.
+    const resolved = buildSecretValueSet((d) =>
+      d.name === 'SLACK_BOT_TOKEN' ? BOT : d.name === 'SLACK_APP_TOKEN' ? APP : undefined,
+    )
+    expect(() => assertNoSecretValues(`payload with ${BOT}`, resolved)).toThrow(BLOCK_MSG)
+    expect(() => assertNoSecretValues(`payload with ${APP}`, resolved)).toThrow(BLOCK_MSG)
+    expect(() => assertNoSecretValues('payload with no secret', resolved)).not.toThrow()
+  })
+
+  test('an unset secret contributes no value to block (resolver returns undefined)', () => {
+    // If the bot token is unset in .env, its (absent) value cannot be leaked,
+    // and the guard must not block arbitrary text on its behalf.
+    const partial = buildSecretValueSet((d) => (d.name === 'SLACK_APP_TOKEN' ? APP : undefined))
+    expect(partial.size).toBe(1)
+    expect(() => assertNoSecretValues(BOT, partial)).not.toThrow()
+    expect(() => assertNoSecretValues(APP, partial)).toThrow(BLOCK_MSG)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Inbound secret-value scrub (ccsc-z0n.2) — buildSecretPlaceholderMap + redactSecretValues
+// ---------------------------------------------------------------------------
+
+describe('inbound secret-value scrub (ccsc-z0n.2)', () => {
+  // Non-token-shaped sentinels (the scrub is value-agnostic; no real shapes
+  // added to the repo — same discipline as the outbound-guard tests above).
+  const BOT = 'CCSC-TEST-BOT-SECRET-value-not-a-real-token'
+  const APP = 'CCSC-TEST-APP-SECRET-value-not-a-real-token'
+  const BOT_PH = secretPlaceholder('SLACK_BOT_TOKEN')
+  const APP_PH = secretPlaceholder('SLACK_APP_TOKEN')
+  const resolve = (d: SecretDeclaration): string | undefined =>
+    d.name === 'SLACK_BOT_TOKEN' ? BOT : d.name === 'SLACK_APP_TOKEN' ? APP : undefined
+
+  describe('buildSecretPlaceholderMap', () => {
+    test('maps each declared live value to that declaration’s placeholder', () => {
+      const map = buildSecretPlaceholderMap(resolve)
+      expect(map.get(BOT)).toBe(BOT_PH)
+      expect(map.get(APP)).toBe(APP_PH)
+      expect(map.size).toBe(2)
+    })
+
+    test('the mapped placeholder is exactly secretPlaceholder(name) — ties to ccsc-z0n.1', () => {
+      const map = buildSecretPlaceholderMap(resolve)
+      // Round-trips back to the declared name via the .1 inverse.
+      expect(secretNameFromPlaceholder(map.get(BOT)!)).toBe('SLACK_BOT_TOKEN')
+      expect(secretNameFromPlaceholder(map.get(APP)!)).toBe('SLACK_APP_TOKEN')
+    })
+
+    test('skips secrets with no resolved value', () => {
+      const map = buildSecretPlaceholderMap((d) => (d.name === 'SLACK_BOT_TOKEN' ? BOT : undefined))
+      expect(map.size).toBe(1)
+      expect(map.get(BOT)).toBe(BOT_PH)
+      const none = buildSecretPlaceholderMap(() => undefined)
+      expect(none.size).toBe(0)
+    })
+  })
+
+  describe('redactSecretValues', () => {
+    const map = buildSecretPlaceholderMap(resolve)
+
+    test('replaces a secret value with its placeholder and counts it', () => {
+      const { text, redactedCount } = redactSecretValues(`token is ${BOT} ok`, map)
+      expect(text).toBe(`token is ${BOT_PH} ok`)
+      expect(redactedCount).toBe(1)
+      expect(text).not.toContain(BOT)
+    })
+
+    test('replaces every occurrence of the same value', () => {
+      const { text, redactedCount } = redactSecretValues(`${BOT} and again ${BOT}`, map)
+      expect(redactedCount).toBe(2)
+      expect(text).toBe(`${BOT_PH} and again ${BOT_PH}`)
+    })
+
+    test('replaces multiple distinct values', () => {
+      const { text, redactedCount } = redactSecretValues(`${BOT} then ${APP}`, map)
+      expect(redactedCount).toBe(2)
+      expect(text).toBe(`${BOT_PH} then ${APP_PH}`)
+    })
+
+    test('clean text is returned unchanged with redactedCount 0', () => {
+      const { text, redactedCount } = redactSecretValues('a normal tool result', map)
+      expect(text).toBe('a normal tool result')
+      expect(redactedCount).toBe(0)
+    })
+
+    test('empty map is a no-op even for text that contains a value', () => {
+      const { text, redactedCount } = redactSecretValues(BOT, new Map())
+      expect(text).toBe(BOT)
+      expect(redactedCount).toBe(0)
+    })
+
+    test('empty / non-string text is a safe no-op', () => {
+      expect(redactSecretValues('', map)).toEqual({ text: '', redactedCount: 0 })
+      expect(redactSecretValues(undefined as unknown as string, map)).toEqual({
+        text: '',
+        redactedCount: 0,
+      })
+    })
+
+    test('an empty-string key never matches (would otherwise match everywhere)', () => {
+      const withEmpty = new Map<string, string>([
+        ['', 'SHOULD-NOT-APPEAR'],
+        [BOT, BOT_PH],
+      ])
+      const { text, redactedCount } = redactSecretValues('clean text', withEmpty)
+      expect(text).toBe('clean text')
+      expect(redactedCount).toBe(0)
+    })
+
+    test('seam: buildSecretPlaceholderMap → redactSecretValues swaps value for placeholder', () => {
+      // End-to-end mirror of how server.ts scrubs a tool result: the value the
+      // guard set knows becomes its declared placeholder; everything else is
+      // untouched.
+      const fileResult = `cat .env =>\nSLACK_APP_TOKEN=${APP}\n`
+      const { text, redactedCount } = redactSecretValues(fileResult, map)
+      expect(redactedCount).toBe(1)
+      expect(text).toBe(`cat .env =>\nSLACK_APP_TOKEN=${APP_PH}\n`)
+      expect(text).not.toContain(APP)
+    })
+  })
+})
 
 describe('assertSendable', () => {
   let root: string // tmp root that stands in for HOME
@@ -4905,6 +5285,1547 @@ describe('createSessionSupervisor.activate', () => {
 })
 
 // ---------------------------------------------------------------------------
+// Fencing lease (ccsc-o7x.1.1) — pure helpers
+// ---------------------------------------------------------------------------
+
+describe('lease helpers (ccsc-o7x.1.1)', () => {
+  const lease: Lease = { token: 7, owner: 'owner-A', heartbeatAt: 1_000_000 }
+
+  describe('resolveLeaseTtlMs', () => {
+    test('defaults when unset or empty', () => {
+      expect(resolveLeaseTtlMs({})).toBe(DEFAULT_LEASE_TTL_MS)
+      expect(resolveLeaseTtlMs({ SLACK_SESSION_LEASE_TTL_MS: '' })).toBe(DEFAULT_LEASE_TTL_MS)
+    })
+    test('defaults on non-numeric / non-positive / non-finite', () => {
+      expect(resolveLeaseTtlMs({ SLACK_SESSION_LEASE_TTL_MS: 'abc' })).toBe(DEFAULT_LEASE_TTL_MS)
+      expect(resolveLeaseTtlMs({ SLACK_SESSION_LEASE_TTL_MS: '0' })).toBe(DEFAULT_LEASE_TTL_MS)
+      expect(resolveLeaseTtlMs({ SLACK_SESSION_LEASE_TTL_MS: '-5' })).toBe(DEFAULT_LEASE_TTL_MS)
+      expect(resolveLeaseTtlMs({ SLACK_SESSION_LEASE_TTL_MS: 'Infinity' })).toBe(
+        DEFAULT_LEASE_TTL_MS,
+      )
+    })
+    test('parses and floors a valid value', () => {
+      expect(resolveLeaseTtlMs({ SLACK_SESSION_LEASE_TTL_MS: '5000' })).toBe(5000)
+      expect(resolveLeaseTtlMs({ SLACK_SESSION_LEASE_TTL_MS: '1500.9' })).toBe(1500)
+    })
+  })
+
+  describe('isLeaseStale', () => {
+    test('not stale within the window', () => {
+      expect(isLeaseStale(lease, lease.heartbeatAt + 500, 1000)).toBe(false)
+    })
+    test('not stale at exactly the TTL boundary (strict >)', () => {
+      expect(isLeaseStale(lease, lease.heartbeatAt + 1000, 1000)).toBe(false)
+    })
+    test('stale one ms past the window', () => {
+      expect(isLeaseStale(lease, lease.heartbeatAt + 1001, 1000)).toBe(true)
+    })
+  })
+
+  describe('heartbeatLease', () => {
+    test('advances heartbeatAt, preserves token + owner, does not mutate input', () => {
+      const renewed = heartbeatLease(lease, 2_000_000)
+      expect(renewed).toEqual({ token: 7, owner: 'owner-A', heartbeatAt: 2_000_000 })
+      expect(lease.heartbeatAt).toBe(1_000_000) // input untouched
+      expect(renewed).not.toBe(lease)
+    })
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Fencing lease (ccsc-o7x.1.1) — supervisor integration
+// ---------------------------------------------------------------------------
+
+describe('createSessionSupervisor fencing lease (ccsc-o7x.1.1)', () => {
+  let rawRoot: string
+  let tmpRoot: string
+  let nowValue: number
+  const TTL = 1000
+  const keyA = { channel: 'C_LEASE', thread: 'TA' }
+  const keyB = { channel: 'C_LEASE', thread: 'TB' }
+
+  beforeEach(() => {
+    rawRoot = mkdtempSync(join(tmpdir(), 'supervisor-lease-'))
+    tmpRoot = realpathSync.native(rawRoot)
+    nowValue = 1_700_000_000_000
+  })
+  afterEach(() => {
+    rmSync(rawRoot, { recursive: true, force: true })
+  })
+
+  function makeSupervisor() {
+    return createSessionSupervisor({
+      stateRoot: tmpRoot,
+      log: () => {},
+      clock: () => nowValue,
+      leaseTtlMs: TTL,
+      ownerId: 'OWNER-1',
+    })
+  }
+
+  test('activation records a lease (token + owner + heartbeat-at)', async () => {
+    const sup = makeSupervisor()
+    const handle = await sup.activate(keyA, 'U_OWNER')
+    expect(handle.lease).not.toBeNull()
+    expect(handle.lease?.owner).toBe('OWNER-1')
+    expect(handle.lease?.heartbeatAt).toBe(nowValue)
+    expect(typeof handle.lease?.token).toBe('number')
+  })
+
+  test('tokens are monotonic across owners', async () => {
+    const sup = makeSupervisor()
+    const a = await sup.activate(keyA, 'U')
+    const b = await sup.activate(keyB, 'U')
+    expect(b.lease!.token).toBeGreaterThan(a.lease!.token)
+  })
+
+  test('heartbeat renews the lease when the token matches', async () => {
+    const sup = makeSupervisor()
+    const handle = await sup.activate(keyA, 'U')
+    const token = handle.lease!.token
+    const t0 = handle.lease!.heartbeatAt
+
+    nowValue += 500
+    expect(handle.heartbeat(token)).toBe(true)
+    expect(handle.lease!.heartbeatAt).toBe(t0 + 500)
+    expect(handle.lease!.token).toBe(token) // token unchanged by heartbeat
+  })
+
+  test('heartbeat with a superseded token does not renew', async () => {
+    const sup = makeSupervisor()
+    const handle = await sup.activate(keyA, 'U')
+    const t0 = handle.lease!.heartbeatAt
+
+    nowValue += 500
+    expect(handle.heartbeat(handle.lease!.token + 999)).toBe(false)
+    expect(handle.lease!.heartbeatAt).toBe(t0) // unchanged
+  })
+
+  test('fenced write succeeds with the live token on a fresh lease', async () => {
+    const sup = makeSupervisor()
+    const handle = await sup.activate(keyA, 'U')
+    await expect(
+      handle.update((s) => ({ ...s, data: { ...s.data, n: 1 } }), handle.lease!.token),
+    ).resolves.toBeUndefined()
+    expect((handle.session.data as Record<string, unknown>).n).toBe(1)
+  })
+
+  test('fenced write is rejected when the token has been superseded', async () => {
+    const sup = makeSupervisor()
+    const handle = await sup.activate(keyA, 'U')
+    const before = handle.session
+    await expect(
+      handle.update((s) => ({ ...s, data: { ...s.data, n: 2 } }), handle.lease!.token + 999),
+    ).rejects.toThrow(/fenced/)
+    expect(handle.session).toBe(before) // nothing persisted
+  })
+
+  test('fenced write is rejected when the lease heartbeat has lapsed', async () => {
+    const sup = makeSupervisor()
+    const handle = await sup.activate(keyA, 'U')
+    const token = handle.lease!.token
+    const before = handle.session
+
+    nowValue += TTL + 1 // lapse the lease without heartbeating
+    await expect(
+      handle.update((s) => ({ ...s, data: { ...s.data, n: 3 } }), token),
+    ).rejects.toThrow(/lapsed/)
+    expect(handle.session).toBe(before)
+  })
+
+  test('a renewed heartbeat un-lapses the lease so the fenced write succeeds', async () => {
+    const sup = makeSupervisor()
+    const handle = await sup.activate(keyA, 'U')
+    const token = handle.lease!.token
+
+    nowValue += TTL + 1 // would be stale...
+    expect(handle.heartbeat(token)).toBe(true) // ...but we renew at the new now
+    await expect(
+      handle.update((s) => ({ ...s, data: { ...s.data, n: 4 } }), token),
+    ).resolves.toBeUndefined()
+    expect((handle.session.data as Record<string, unknown>).n).toBe(4)
+  })
+
+  test('an unfenced update still works regardless of lease (backward compatible)', async () => {
+    const sup = makeSupervisor()
+    const handle = await sup.activate(keyA, 'U')
+    nowValue += TTL + 1 // lease is stale, but no fenceToken passed
+    await expect(
+      handle.update((s) => ({ ...s, data: { ...s.data, n: 5 } })),
+    ).resolves.toBeUndefined()
+    expect((handle.session.data as Record<string, unknown>).n).toBe(5)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Crash-recovery sweep (ccsc-o7x.1.2)
+// ---------------------------------------------------------------------------
+
+describe('classifyRecovery (ccsc-o7x.1.2)', () => {
+  const turn = (heartbeatAt: number): InFlightTurn => ({
+    owner: 'O',
+    token: 1,
+    startedAt: heartbeatAt,
+    heartbeatAt,
+  })
+
+  test('resumable when the heartbeat has lapsed past the TTL', () => {
+    expect(classifyRecovery(turn(1000), 1000 + 1001, 1000)).toBe('resumable')
+  })
+  test('orphaned when the heartbeat is still fresh (within TTL)', () => {
+    expect(classifyRecovery(turn(1000), 1000 + 500, 1000)).toBe('orphaned')
+  })
+  test('orphaned at exactly the TTL boundary (strict >, mirrors isLeaseStale)', () => {
+    expect(classifyRecovery(turn(1000), 1000 + 1000, 1000)).toBe('orphaned')
+  })
+})
+
+describe('createSessionSupervisor recovery sweep (ccsc-o7x.1.2)', () => {
+  let rawRoot: string
+  let tmpRoot: string
+  let nowValue: number
+  let journalEvents: Array<{ kind: string }>
+  const TTL = 1000
+
+  beforeEach(() => {
+    rawRoot = mkdtempSync(join(tmpdir(), 'supervisor-recovery-'))
+    tmpRoot = realpathSync.native(rawRoot)
+    nowValue = 1_700_000_000_000
+    journalEvents = []
+  })
+  afterEach(() => {
+    rmSync(rawRoot, { recursive: true, force: true })
+  })
+
+  function makeSupervisor() {
+    return createSessionSupervisor({
+      stateRoot: tmpRoot,
+      log: () => {},
+      clock: () => nowValue,
+      leaseTtlMs: TTL,
+      ownerId: 'OWNER-NEW',
+      journal: {
+        writeEvent: async (e: { kind: string }) => {
+          journalEvents.push(e)
+          return {}
+        },
+      } as unknown as import('./journal.ts').JournalWriter,
+    })
+  }
+
+  async function seed(key: SessionKey, inFlightTurn?: InFlightTurn): Promise<void> {
+    const s: Session = {
+      v: 1,
+      key,
+      createdAt: nowValue - 1_000_000,
+      lastActiveAt: nowValue - 1_000_000,
+      ownerId: 'U',
+      data: {},
+      ...(inFlightTurn ? { inFlightTurn } : {}),
+    }
+    await saveSession(sessionPath(tmpRoot, key), s)
+  }
+
+  test('clean state dir → zero report, no recovery journal events', async () => {
+    const sup = makeSupervisor()
+    const report = await sup.recoverOnStartup()
+    expect(report).toEqual({ scanned: 0, requeued: [], orphaned: [] })
+    expect(journalEvents.filter((e) => e.kind.startsWith('session.recovery'))).toHaveLength(0)
+  })
+
+  test('a clean session (no marker) is scanned but neither requeued nor orphaned', async () => {
+    const key = { channel: 'C_REC', thread: 'clean' }
+    await seed(key)
+    const sup = makeSupervisor()
+    const report = await sup.recoverOnStartup()
+    expect(report.scanned).toBe(1)
+    expect(report.requeued).toHaveLength(0)
+    expect(report.orphaned).toHaveLength(0)
+  })
+
+  test('a stale in-flight marker is requeued — marker cleared on disk + journaled', async () => {
+    const key = { channel: 'C_REC', thread: 'stale' }
+    await seed(key, { owner: 'OLD', token: 3, startedAt: 0, heartbeatAt: nowValue - (TTL + 1) })
+    const sup = makeSupervisor()
+
+    const report = await sup.recoverOnStartup()
+    expect(report.requeued).toEqual([key])
+    expect(report.orphaned).toHaveLength(0)
+
+    // Marker cleared on disk.
+    const reloaded = await loadSession(tmpRoot, sessionPath(tmpRoot, key))
+    expect(reloaded.inFlightTurn).toBeUndefined()
+    // Journaled exactly one requeued event.
+    expect(journalEvents.filter((e) => e.kind === 'session.recovery.requeued')).toHaveLength(1)
+
+    // A requeued session re-activates cleanly.
+    await expect(sup.activate(key, 'U')).resolves.toBeDefined()
+  })
+
+  test('a fresh in-flight marker is orphaned — quarantined + journaled, activate rejects', async () => {
+    const key = { channel: 'C_REC', thread: 'fresh' }
+    await seed(key, { owner: 'OLD', token: 4, startedAt: 0, heartbeatAt: nowValue - 100 })
+    const sup = makeSupervisor()
+
+    const report = await sup.recoverOnStartup()
+    expect(report.orphaned).toEqual([key])
+    expect(report.requeued).toHaveLength(0)
+    expect(journalEvents.filter((e) => e.kind === 'session.recovery.orphaned')).toHaveLength(1)
+
+    // Orphaned → quarantined → activate now rejects.
+    await expect(sup.activate(key, 'U')).rejects.toThrow()
+  })
+
+  test('seeds the lease-token counter above the highest persisted token', async () => {
+    const key = { channel: 'C_REC', thread: 'tok' }
+    await seed(key, { owner: 'OLD', token: 50, startedAt: 0, heartbeatAt: nowValue - (TTL + 1) })
+    const sup = makeSupervisor()
+    await sup.recoverOnStartup() // seeds nextLeaseToken to 50
+
+    // A fresh activation on a different key must mint a token strictly above 50,
+    // so a restarted process never re-issues a crashed owner's token.
+    const handle = await sup.activate({ channel: 'C_REC', thread: 'newkey' }, 'U')
+    expect(handle.lease!.token).toBeGreaterThan(50)
+  })
+
+  test('a file that loads-strict-rejects is orphaned (unreadable branch)', async () => {
+    // listSessions summarises it (createdAt/lastActiveAt/ownerId valid), but
+    // loadSession's strict schema rejects the malformed inFlightTurn.owner.
+    const key = { channel: 'C_REC', thread: 'bad' }
+    const p = sessionPath(tmpRoot, key)
+    mkdirSync(join(tmpRoot, 'sessions', 'C_REC'), { recursive: true })
+    writeFileSync(
+      p,
+      JSON.stringify({
+        v: 1,
+        key,
+        createdAt: nowValue,
+        lastActiveAt: nowValue,
+        ownerId: 'U',
+        data: {},
+        inFlightTurn: { owner: 12345, token: 1, startedAt: 0, heartbeatAt: 0 },
+      }),
+    )
+    const sup = makeSupervisor()
+    const report = await sup.recoverOnStartup()
+    expect(report.orphaned).toEqual([key])
+    expect(journalEvents.filter((e) => e.kind === 'session.recovery.orphaned')).toHaveLength(1)
+  })
+
+  test('classifies multiple sessions independently in one sweep', async () => {
+    await seed({ channel: 'C_M', thread: 'a' }) // clean
+    await seed(
+      { channel: 'C_M', thread: 'b' },
+      { owner: 'O', token: 1, startedAt: 0, heartbeatAt: nowValue - (TTL + 1) },
+    ) // stale → requeue
+    await seed(
+      { channel: 'C_M', thread: 'c' },
+      { owner: 'O', token: 2, startedAt: 0, heartbeatAt: nowValue - 10 },
+    ) // fresh → orphan
+    const sup = makeSupervisor()
+    const report = await sup.recoverOnStartup()
+    expect(report.scanned).toBe(3)
+    expect(report.requeued).toHaveLength(1)
+    expect(report.orphaned).toHaveLength(1)
+  })
+})
+
+describe('SessionHandle.recordTurnStart / recordTurnEnd (ccsc-o7x.1.2)', () => {
+  let rawRoot: string
+  let tmpRoot: string
+  let nowValue: number
+  const key = { channel: 'C_TURN', thread: 'T1' }
+
+  beforeEach(() => {
+    rawRoot = mkdtempSync(join(tmpdir(), 'supervisor-turn-'))
+    tmpRoot = realpathSync.native(rawRoot)
+    nowValue = 1_700_000_000_000
+  })
+  afterEach(() => {
+    rmSync(rawRoot, { recursive: true, force: true })
+  })
+
+  function makeSupervisor() {
+    return createSessionSupervisor({
+      stateRoot: tmpRoot,
+      log: () => {},
+      clock: () => nowValue,
+      leaseTtlMs: 1000,
+      ownerId: 'OWNER-1',
+    })
+  }
+
+  test('recordTurnStart persists an in-flight marker (owner+token+startedAt+heartbeatAt)', async () => {
+    const sup = makeSupervisor()
+    const handle = await sup.activate(key, 'U')
+    const token = handle.lease!.token
+
+    await handle.recordTurnStart(token)
+    expect(handle.session.inFlightTurn).toEqual({
+      owner: 'OWNER-1',
+      token,
+      startedAt: nowValue,
+      heartbeatAt: nowValue,
+    })
+    // Persisted on disk.
+    const reloaded = await loadSession(tmpRoot, sessionPath(tmpRoot, key))
+    expect(reloaded.inFlightTurn?.token).toBe(token)
+  })
+
+  test('recordTurnStart rejects when the token is not the current lease', async () => {
+    const sup = makeSupervisor()
+    const handle = await sup.activate(key, 'U')
+    await expect(handle.recordTurnStart(handle.lease!.token + 999)).rejects.toThrow(
+      /does not match the current lease/,
+    )
+    expect(handle.session.inFlightTurn).toBeUndefined()
+  })
+
+  test('recordTurnEnd clears the marker', async () => {
+    const sup = makeSupervisor()
+    const handle = await sup.activate(key, 'U')
+    const token = handle.lease!.token
+    await handle.recordTurnStart(token)
+    expect(handle.session.inFlightTurn).toBeDefined()
+
+    await handle.recordTurnEnd()
+    expect(handle.session.inFlightTurn).toBeUndefined()
+    const reloaded = await loadSession(tmpRoot, sessionPath(tmpRoot, key))
+    expect(reloaded.inFlightTurn).toBeUndefined()
+  })
+
+  test('round-trip: recordTurnStart → crash → fresh supervisor sweep requeues the lapsed turn', async () => {
+    const sup = makeSupervisor()
+    const handle = await sup.activate(key, 'U')
+    await handle.recordTurnStart(handle.lease!.token)
+
+    // Simulate a crash: drop the supervisor, advance the clock past the TTL,
+    // and bring up a fresh supervisor against the same state dir.
+    nowValue += 5000
+    const recovered = createSessionSupervisor({
+      stateRoot: tmpRoot,
+      log: () => {},
+      clock: () => nowValue,
+      leaseTtlMs: 1000,
+      ownerId: 'OWNER-2',
+    })
+    const report = await recovered.recoverOnStartup()
+    expect(report.requeued).toEqual([key])
+    const reloaded = await loadSession(tmpRoot, sessionPath(tmpRoot, key))
+    expect(reloaded.inFlightTurn).toBeUndefined()
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Lease-loss → quarantine (ccsc-o7x.1.3)
+// ---------------------------------------------------------------------------
+
+describe('lease-loss quarantine (ccsc-o7x.1.3)', () => {
+  let rawRoot: string
+  let tmpRoot: string
+  let nowValue: number
+  const TTL = 1000
+  const key = { channel: 'C_QL', thread: 'T1' }
+
+  beforeEach(() => {
+    rawRoot = mkdtempSync(join(tmpdir(), 'supervisor-leaseloss-'))
+    tmpRoot = realpathSync.native(rawRoot)
+    nowValue = 1_700_000_000_000
+  })
+  afterEach(() => {
+    rmSync(rawRoot, { recursive: true, force: true })
+  })
+
+  function makeSupervisor() {
+    return createSessionSupervisor({
+      stateRoot: tmpRoot,
+      log: () => {},
+      clock: () => nowValue,
+      leaseTtlMs: TTL,
+      ownerId: 'OWNER-1',
+    })
+  }
+
+  test('a fenced write with a superseded token quarantines the handle', async () => {
+    const sup = makeSupervisor()
+    const handle = await sup.activate(key, 'U')
+    await expect(
+      handle.update((s) => ({ ...s, data: { x: 1 } }), handle.lease!.token + 999),
+    ).rejects.toThrow(/lease lost/)
+    expect(handle.state).toBe('quarantined')
+  })
+
+  test('a fenced write whose lease has lapsed quarantines the handle', async () => {
+    const sup = makeSupervisor()
+    const handle = await sup.activate(key, 'U')
+    const token = handle.lease!.token
+    nowValue += TTL + 1 // lapse without heartbeating
+    await expect(handle.update((s) => ({ ...s, data: { x: 2 } }), token)).rejects.toThrow(/lapsed/)
+    expect(handle.state).toBe('quarantined')
+  })
+
+  test('a quarantined turn performs no further work — even an unfenced update rejects', async () => {
+    const sup = makeSupervisor()
+    const handle = await sup.activate(key, 'U')
+    // Lose the lease.
+    await expect(handle.update((s) => s, handle.lease!.token + 999)).rejects.toThrow(/quarantined/)
+    // Any subsequent write — fenced or not — is refused.
+    await expect(handle.update((s) => ({ ...s, data: { y: 1 } }))).rejects.toThrow(/quarantined/)
+  })
+
+  test('a lease-lost session is excluded from the active set (activate rejects until cleared)', async () => {
+    const sup = makeSupervisor()
+    const handle = await sup.activate(key, 'U')
+    await expect(handle.update((s) => s, handle.lease!.token + 999)).rejects.toThrow()
+    expect(handle.state).toBe('quarantined')
+
+    // Removed from live + recorded in quarantine ⇒ re-activation rejects.
+    await expect(sup.activate(key, 'U')).rejects.toThrow()
+
+    // Operator clears the quarantine ⇒ activation succeeds again with a fresh lease.
+    sup.clearQuarantine(key)
+    const reactivated = await sup.activate(key, 'U')
+    expect(reactivated.state).toBe('active')
+    expect(reactivated.lease).not.toBeNull()
+  })
+
+  test('the idle reaper leaves a quarantined session alone', async () => {
+    const sup = makeSupervisor()
+    const handle = await sup.activate(key, 'U')
+    await expect(handle.update((s) => s, handle.lease!.token + 999)).rejects.toThrow()
+    // Advancing well past any idle threshold must not let the reaper touch it.
+    nowValue += 10 * 60 * 60 * 1000
+    await expect(sup.reapIdle()).resolves.toBeUndefined()
+    expect(handle.state).toBe('quarantined')
+  })
+
+  test('a healthy fenced write (live token, fresh lease) does NOT quarantine', async () => {
+    const sup = makeSupervisor()
+    const handle = await sup.activate(key, 'U')
+    await expect(
+      handle.update((s) => ({ ...s, data: { ok: 1 } }), handle.lease!.token),
+    ).resolves.toBeUndefined()
+    expect(handle.state).toBe('active')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Reply-delivery outbox — record obligation (ccsc-o7x.2.1)
+// ---------------------------------------------------------------------------
+
+describe('reply-delivery outbox (ccsc-o7x.2.1)', () => {
+  let rawRoot: string
+  let tmpRoot: string
+  let nowValue: number
+  const key = { channel: 'C_OBX', thread: 'T1' }
+
+  beforeEach(() => {
+    rawRoot = mkdtempSync(join(tmpdir(), 'supervisor-outbox-'))
+    tmpRoot = realpathSync.native(rawRoot)
+    nowValue = 1_700_000_000_000
+  })
+  afterEach(() => {
+    rmSync(rawRoot, { recursive: true, force: true })
+  })
+
+  function makeSupervisor() {
+    return createSessionSupervisor({
+      stateRoot: tmpRoot,
+      log: () => {},
+      clock: () => nowValue,
+      leaseTtlMs: 1000,
+      ownerId: 'OWNER-1',
+    })
+  }
+
+  const reply = { id: 'd-1', channel: 'C_OBX', thread: 'T1', payload: 'hello' }
+
+  test('recordTerminalDelivery persists a pending obligation (stamps attempts/state/createdAt)', async () => {
+    const sup = makeSupervisor()
+    const handle = await sup.activate(key, 'U')
+    await handle.recordTerminalDelivery(handle.lease!.token, reply)
+
+    expect(handle.session.outbox).toEqual([
+      {
+        id: 'd-1',
+        channel: 'C_OBX',
+        thread: 'T1',
+        payload: 'hello',
+        attempts: 0,
+        state: 'pending',
+        createdAt: nowValue,
+      },
+    ])
+    // Persisted on disk.
+    const reloaded = await loadSession(tmpRoot, sessionPath(tmpRoot, key))
+    expect(reloaded.outbox?.[0]?.id).toBe('d-1')
+  })
+
+  test('records the obligation atomically with the terminal marker — one write clears inFlightTurn AND appends', async () => {
+    const sup = makeSupervisor()
+    const handle = await sup.activate(key, 'U')
+    const token = handle.lease!.token
+    await handle.recordTurnStart(token)
+    expect(handle.session.inFlightTurn).toBeDefined()
+
+    await handle.recordTerminalDelivery(token, reply)
+    // Same write: marker gone, obligation present.
+    expect(handle.session.inFlightTurn).toBeUndefined()
+    expect(handle.session.outbox).toHaveLength(1)
+    const reloaded = await loadSession(tmpRoot, sessionPath(tmpRoot, key))
+    expect(reloaded.inFlightTurn).toBeUndefined()
+    expect(reloaded.outbox).toHaveLength(1)
+  })
+
+  test('recordTerminalDelivery is fenced — a superseded token rejects and writes nothing', async () => {
+    const sup = makeSupervisor()
+    const handle = await sup.activate(key, 'U')
+    await expect(handle.recordTerminalDelivery(handle.lease!.token + 999, reply)).rejects.toThrow(
+      /fenced|lease lost/,
+    )
+    expect(handle.session.outbox).toBeUndefined()
+  })
+
+  test('multiple terminal deliveries accumulate in the outbox', async () => {
+    const sup = makeSupervisor()
+    const handle = await sup.activate(key, 'U')
+    const token = handle.lease!.token
+    await handle.recordTerminalDelivery(token, { ...reply, id: 'd-1' })
+    await handle.recordTerminalDelivery(token, { ...reply, id: 'd-2' })
+    expect(handle.session.outbox?.map((o) => o.id)).toEqual(['d-1', 'd-2'])
+  })
+
+  test('pendingDeliveries returns pending obligations across sessions', async () => {
+    const sup = makeSupervisor()
+    const h1 = await sup.activate({ channel: 'C_OBX', thread: 'a' }, 'U')
+    await h1.recordTerminalDelivery(h1.lease!.token, { ...reply, id: 'a-1', thread: 'a' })
+    const h2 = await sup.activate({ channel: 'C_OBX', thread: 'b' }, 'U')
+    await h2.recordTerminalDelivery(h2.lease!.token, { ...reply, id: 'b-1', thread: 'b' })
+
+    const pending = await sup.pendingDeliveries()
+    expect(pending.map((o) => o.id).sort()).toEqual(['a-1', 'b-1'])
+  })
+
+  test('a crash after terminal-but-before-send leaves a pending obligation a fresh supervisor sees', async () => {
+    const sup = makeSupervisor()
+    const handle = await sup.activate(key, 'U')
+    await handle.recordTerminalDelivery(handle.lease!.token, reply)
+
+    // Simulate a crash before the send: drop the supervisor, bring up a fresh
+    // one against the same state dir. The obligation is still pending.
+    const recovered = makeSupervisor()
+    const pending = await recovered.pendingDeliveries()
+    expect(pending).toHaveLength(1)
+    expect(pending[0]?.id).toBe('d-1')
+  })
+
+  test('pendingDeliveries excludes non-pending obligations and clean sessions', async () => {
+    // Seed a session whose obligation is already delivered — must be excluded.
+    const delivered: DeliveryObligation = {
+      id: 'gone',
+      channel: 'C_OBX',
+      thread: 'done',
+      payload: 'x',
+      attempts: 1,
+      state: 'delivered',
+      createdAt: nowValue,
+    }
+    const s: Session = {
+      v: 1,
+      key: { channel: 'C_OBX', thread: 'done' },
+      createdAt: nowValue,
+      lastActiveAt: nowValue,
+      ownerId: 'U',
+      data: {},
+      outbox: [delivered],
+    }
+    await saveSession(sessionPath(tmpRoot, { channel: 'C_OBX', thread: 'done' }), s)
+    // And a clean session with no outbox at all.
+    const clean: Session = {
+      v: 1,
+      key: { channel: 'C_OBX', thread: 'clean' },
+      createdAt: nowValue,
+      lastActiveAt: nowValue,
+      ownerId: 'U',
+      data: {},
+    }
+    await saveSession(sessionPath(tmpRoot, { channel: 'C_OBX', thread: 'clean' }), clean)
+
+    const sup = makeSupervisor()
+    expect(await sup.pendingDeliveries()).toHaveLength(0)
+  })
+
+  test('pendingDeliveries on an empty state dir returns []', async () => {
+    const sup = makeSupervisor()
+    expect(await sup.pendingDeliveries()).toEqual([])
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Delivery classification + backoff — pure helpers (ccsc-o7x.2.2)
+// ---------------------------------------------------------------------------
+
+describe('delivery error classification (ccsc-o7x.2.2)', () => {
+  test('known permanent Slack codes classify non-retryable', () => {
+    for (const code of [
+      'channel_not_found',
+      'not_in_channel',
+      'is_archived',
+      'invalid_auth',
+      'account_inactive',
+      'token_revoked',
+      'no_permission',
+      'msg_too_long',
+      'no_text',
+      'restricted_action',
+      'cannot_dm_bot',
+    ]) {
+      expect(classifyDeliveryError(code)).toBe('non-retryable')
+    }
+  })
+
+  test('transient / unknown / undefined codes default to retryable', () => {
+    expect(classifyDeliveryError('rate_limited')).toBe('retryable')
+    expect(classifyDeliveryError('internal_error')).toBe('retryable')
+    expect(classifyDeliveryError('service_unavailable')).toBe('retryable')
+    expect(classifyDeliveryError('ECONNRESET')).toBe('retryable')
+    expect(classifyDeliveryError('slack_webapi_rate_limited_error')).toBe('retryable')
+    expect(classifyDeliveryError('some_brand_new_code')).toBe('retryable')
+    expect(classifyDeliveryError(undefined)).toBe('retryable')
+  })
+
+  test('NON_RETRYABLE_SLACK_ERRORS holds the permanent codes and excludes rate_limited', () => {
+    expect(NON_RETRYABLE_SLACK_ERRORS.has('channel_not_found')).toBe(true)
+    expect(NON_RETRYABLE_SLACK_ERRORS.has('invalid_auth')).toBe(true)
+    expect(NON_RETRYABLE_SLACK_ERRORS.has('rate_limited')).toBe(false)
+  })
+})
+
+describe('extractSlackErrorCode (ccsc-o7x.2.2)', () => {
+  test('prefers err.data.error (the canonical Slack Web API code)', () => {
+    expect(extractSlackErrorCode({ data: { error: 'channel_not_found' } })).toBe(
+      'channel_not_found',
+    )
+    // A real @slack/web-api WebAPIPlatformError shape: Error + .data.error.
+    const platformErr = Object.assign(new Error('An API error occurred'), {
+      code: 'slack_webapi_platform_error',
+      data: { ok: false, error: 'not_in_channel' },
+    })
+    expect(extractSlackErrorCode(platformErr)).toBe('not_in_channel')
+  })
+
+  test('falls back to err.code when no data.error is present', () => {
+    expect(extractSlackErrorCode({ code: 'slack_webapi_rate_limited_error' })).toBe(
+      'slack_webapi_rate_limited_error',
+    )
+    expect(
+      extractSlackErrorCode(Object.assign(new Error('socket hang up'), { code: 'ECONNRESET' })),
+    ).toBe('ECONNRESET')
+  })
+
+  test('returns undefined for non-object throws and empty/absent codes', () => {
+    expect(extractSlackErrorCode(undefined)).toBeUndefined()
+    expect(extractSlackErrorCode(null)).toBeUndefined()
+    expect(extractSlackErrorCode('a string')).toBeUndefined()
+    expect(extractSlackErrorCode(new Error('plain'))).toBeUndefined()
+    expect(extractSlackErrorCode({ data: { error: '' } })).toBeUndefined()
+    expect(extractSlackErrorCode({ code: '' })).toBeUndefined()
+  })
+})
+
+describe('computeBackoffMs (ccsc-o7x.2.2)', () => {
+  test('no wait before the first attempt', () => {
+    expect(computeBackoffMs(0)).toBe(0)
+    expect(computeBackoffMs(-3)).toBe(0)
+  })
+
+  test('exponential growth with the defaults (250ms base, x2)', () => {
+    expect(computeBackoffMs(1)).toBe(250)
+    expect(computeBackoffMs(2)).toBe(500)
+    expect(computeBackoffMs(3)).toBe(1000)
+    expect(computeBackoffMs(4)).toBe(2000)
+  })
+
+  test('clamps to maxMs and honors custom tunables', () => {
+    expect(computeBackoffMs(100)).toBe(30_000) // default cap
+    expect(computeBackoffMs(3, { baseMs: 100, factor: 3, maxMs: 10_000 })).toBe(900)
+    expect(computeBackoffMs(10, { baseMs: 100, factor: 3, maxMs: 10_000 })).toBe(10_000)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Delivery poller — drainOutbox (ccsc-o7x.2.2)
+// ---------------------------------------------------------------------------
+
+describe('delivery poller drainOutbox (ccsc-o7x.2.2)', () => {
+  let rawRoot: string
+  let tmpRoot: string
+  let nowValue: number
+  const key = { channel: 'C_POLL', thread: 'T1' }
+
+  beforeEach(() => {
+    rawRoot = mkdtempSync(join(tmpdir(), 'supervisor-poller-'))
+    tmpRoot = realpathSync.native(rawRoot)
+    nowValue = 1_700_000_000_000
+  })
+  afterEach(() => {
+    rmSync(rawRoot, { recursive: true, force: true })
+  })
+
+  function makeSupervisor() {
+    return createSessionSupervisor({
+      stateRoot: tmpRoot,
+      log: () => {},
+      clock: () => nowValue,
+      leaseTtlMs: 1000,
+      ownerId: 'OWNER-1',
+    })
+  }
+
+  const reply = { id: 'd-1', channel: 'C_POLL', thread: 'T1', payload: 'hello' }
+
+  /** Supersede a handle's lease in place to simulate a newer owner taking over —
+   *  the only way to drive `heartbeat(oldToken) === false` through a realistic
+   *  path (a fresh activation by a new owner re-acquires the lease). */
+  function supersedeLease(handle: SessionHandle, owner: string, token: number): void {
+    ;(handle as unknown as { acquireLease(o: string, t: number): Lease }).acquireLease(owner, token)
+  }
+
+  /** A Slack-shaped error carrying a canonical Web API code. */
+  function slackError(code: string): Error {
+    return Object.assign(new Error(`slack: ${code}`), { data: { ok: false, error: code } })
+  }
+
+  async function seedObligation(over: Partial<typeof reply> = {}): Promise<void> {
+    const sup = makeSupervisor()
+    const handle = await sup.activate(key, 'U')
+    await handle.recordTerminalDelivery(handle.lease!.token, { ...reply, ...over })
+  }
+
+  test('empty outbox → zero report, send never called', async () => {
+    const sup = makeSupervisor()
+    let calls = 0
+    const report = await sup.drainOutbox(async () => {
+      calls++
+    })
+    expect(report).toEqual({ scanned: 0, delivered: [], deadLettered: [], skipped: [] })
+    expect(calls).toBe(0)
+  })
+
+  test('successful send marks the obligation delivered and clears it from pending', async () => {
+    await seedObligation()
+    const sup = makeSupervisor()
+    const sent: DeliveryObligation[] = []
+    const report = await sup.drainOutbox(async (ob) => {
+      sent.push(ob)
+    })
+
+    expect(sent.map((o) => o.id)).toEqual(['d-1'])
+    expect(report.scanned).toBe(1)
+    expect(report.delivered).toEqual(['d-1'])
+    expect(report.deadLettered).toEqual([])
+    expect(report.skipped).toEqual([])
+
+    // Persisted: state delivered, attempts incremented, no lastError on success.
+    const reloaded = await loadSession(tmpRoot, sessionPath(tmpRoot, key))
+    expect(reloaded.outbox?.[0]?.state).toBe('delivered')
+    expect(reloaded.outbox?.[0]?.attempts).toBe(1)
+    expect(reloaded.outbox?.[0]?.lastError).toBeUndefined()
+    // No longer pending.
+    expect(await sup.pendingDeliveries()).toHaveLength(0)
+  })
+
+  test('non-retryable Slack error dead-letters immediately with the error recorded (no retry)', async () => {
+    await seedObligation()
+    const sup = makeSupervisor()
+    const delays: number[] = []
+    let calls = 0
+    const report = await sup.drainOutbox(
+      async () => {
+        calls++
+        throw slackError('channel_not_found')
+      },
+      { delayMs: async (ms) => void delays.push(ms) },
+    )
+
+    expect(calls).toBe(1) // no retry on a permanent error
+    expect(delays).toEqual([]) // never backed off
+    expect(report.delivered).toEqual([])
+    expect(report.deadLettered).toEqual([{ id: 'd-1', error: 'channel_not_found' }])
+
+    const reloaded = await loadSession(tmpRoot, sessionPath(tmpRoot, key))
+    expect(reloaded.outbox?.[0]?.state).toBe('dead')
+    expect(reloaded.outbox?.[0]?.attempts).toBe(1)
+    expect(reloaded.outbox?.[0]?.lastError).toBe('channel_not_found')
+  })
+
+  test('retryable error retries with exponential backoff up to the cap, then dead-letters', async () => {
+    await seedObligation()
+    const sup = makeSupervisor()
+    const delays: number[] = []
+    let calls = 0
+    const report = await sup.drainOutbox(
+      async () => {
+        calls++
+        throw slackError('rate_limited') // always fails, always retryable
+      },
+      { maxAttempts: 3, delayMs: async (ms) => void delays.push(ms) },
+    )
+
+    expect(calls).toBe(3) // attempts capped
+    expect(delays).toEqual([250, 500]) // backoff before retries 2 and 3
+    expect(report.deadLettered).toEqual([{ id: 'd-1', error: 'rate_limited' }])
+
+    const reloaded = await loadSession(tmpRoot, sessionPath(tmpRoot, key))
+    expect(reloaded.outbox?.[0]?.state).toBe('dead')
+    expect(reloaded.outbox?.[0]?.attempts).toBe(3)
+    expect(reloaded.outbox?.[0]?.lastError).toBe('rate_limited')
+  })
+
+  test('retryable error that recovers is delivered (no dead-letter)', async () => {
+    await seedObligation()
+    const sup = makeSupervisor()
+    const delays: number[] = []
+    let calls = 0
+    const report = await sup.drainOutbox(
+      async () => {
+        calls++
+        if (calls < 2) throw slackError('service_unavailable')
+      },
+      { delayMs: async (ms) => void delays.push(ms) },
+    )
+
+    expect(calls).toBe(2) // failed once, succeeded on the retry
+    expect(delays).toEqual([250]) // one backoff
+    expect(report.delivered).toEqual(['d-1'])
+    expect(report.deadLettered).toEqual([])
+
+    const reloaded = await loadSession(tmpRoot, sessionPath(tmpRoot, key))
+    expect(reloaded.outbox?.[0]?.state).toBe('delivered')
+    expect(reloaded.outbox?.[0]?.attempts).toBe(2)
+    // lastError is not retained on a delivered record.
+    expect(reloaded.outbox?.[0]?.lastError).toBeUndefined()
+  })
+
+  test('default attempt cap is DEFAULT_MAX_DELIVERY_ATTEMPTS', async () => {
+    await seedObligation()
+    const sup = makeSupervisor()
+    let calls = 0
+    await sup.drainOutbox(
+      async () => {
+        calls++
+        throw slackError('internal_error')
+      },
+      { delayMs: async () => {} },
+    )
+    expect(calls).toBe(DEFAULT_MAX_DELIVERY_ATTEMPTS)
+  })
+
+  test('lease contention: a lease superseded mid-retry yields without a second send (no double-send)', async () => {
+    await seedObligation()
+    const sup = makeSupervisor()
+    const handle = await sup.activate(key) // same cached handle the poller will use
+    const token = handle.lease!.token
+
+    let calls = 0
+    const report = await sup.drainOutbox(
+      async () => {
+        calls++
+        throw slackError('rate_limited') // retryable → would normally retry
+      },
+      {
+        // During the first backoff a newer owner takes the lease. The next
+        // iteration's pre-send heartbeat check fails → the poller yields.
+        delayMs: async () => {
+          supersedeLease(handle, 'OWNER-2', token + 100)
+        },
+      },
+    )
+
+    expect(calls).toBe(1) // sent once, then yielded — never double-sent
+    expect(report.delivered).toEqual([])
+    expect(report.deadLettered).toEqual([])
+    expect(report.skipped).toEqual(['d-1'])
+
+    // Obligation is left pending for the live owner.
+    const reloaded = await loadSession(tmpRoot, sessionPath(tmpRoot, key))
+    expect(reloaded.outbox?.[0]?.state).toBe('pending')
+  })
+
+  test('lease contention: a lease superseded before the persist yields without committing (delivery not marked)', async () => {
+    await seedObligation()
+    const sup = makeSupervisor()
+    const handle = await sup.activate(key)
+    const token = handle.lease!.token
+
+    let calls = 0
+    const report = await sup.drainOutbox(async () => {
+      calls++
+      // The send itself "succeeds", but a newer owner takes the lease before the
+      // persist. The pre-persist lease check yields → the obligation is not
+      // marked delivered (and the session is NOT quarantined).
+      supersedeLease(handle, 'OWNER-2', token + 100)
+    })
+
+    expect(calls).toBe(1)
+    expect(report.delivered).toEqual([])
+    expect(report.skipped).toEqual(['d-1'])
+    const reloaded = await loadSession(tmpRoot, sessionPath(tmpRoot, key))
+    expect(reloaded.outbox?.[0]?.state).toBe('pending') // still owed, for 2.3 to dedup
+    // The legitimate new owner is not locked out — the key was not quarantined.
+    expect(reloaded.outbox?.[0]?.attempts).toBe(0)
+  })
+
+  test('drains obligations across multiple sessions independently', async () => {
+    const seed = makeSupervisor()
+    const ha = await seed.activate({ channel: 'C_POLL', thread: 'a' }, 'U')
+    await ha.recordTerminalDelivery(ha.lease!.token, { ...reply, id: 'a-1', thread: 'a' })
+    const hb = await seed.activate({ channel: 'C_POLL', thread: 'b' }, 'U')
+    await hb.recordTerminalDelivery(hb.lease!.token, { ...reply, id: 'b-1', thread: 'b' })
+
+    const sup = makeSupervisor()
+    const sentIds: string[] = []
+    const report = await sup.drainOutbox(
+      async (ob) => {
+        if (ob.id === 'b-1') throw slackError('not_in_channel') // one fails permanently
+        sentIds.push(ob.id)
+      },
+      { delayMs: async () => {} },
+    )
+
+    expect(report.scanned).toBe(2)
+    expect(report.delivered).toEqual(['a-1'])
+    expect(report.deadLettered).toEqual([{ id: 'b-1', error: 'not_in_channel' }])
+    expect(sentIds).toEqual(['a-1'])
+  })
+
+  test('a corrupt/unreadable session file is skipped, never throwing', async () => {
+    // Seed an obligation, then corrupt the file. The outbox scan skips an
+    // unreadable session (the recovery sweep is the path that quarantines it),
+    // so the drain neither sees the obligation nor throws.
+    await seedObligation()
+    writeFileSync(sessionPath(tmpRoot, key), 'not json at all', 'utf8')
+
+    const sup = makeSupervisor()
+    let calls = 0
+    const report = await sup.drainOutbox(async () => {
+      calls++
+    })
+
+    // pendingDeliveries skips the unreadable file, so nothing is scanned.
+    expect(report.scanned).toBe(0)
+    expect(calls).toBe(0)
+  })
+
+  test('a second pass does not re-process delivered/dead obligations', async () => {
+    await seedObligation()
+    const sup = makeSupervisor()
+    await sup.drainOutbox(async () => {}) // first pass delivers d-1
+
+    let calls = 0
+    const report = await sup.drainOutbox(async () => {
+      calls++
+    })
+    expect(report.scanned).toBe(0) // d-1 is delivered, no longer pending
+    expect(calls).toBe(0)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Idempotent redelivery — makeIdempotentSend (ccsc-o7x.2.3)
+// ---------------------------------------------------------------------------
+
+interface FakePost {
+  key: string
+  channel: string
+  thread: string
+  payload: string
+}
+
+/** A fake Slack the idempotent send posts into, keyed by idempotency key. With
+ *  `failFirstPostAfterStoring` the first post LANDS the message then throws —
+ *  simulating an ack lost after Slack already accepted the post (the ambiguous
+ *  failure idempotency must survive). */
+function makeFakeSlack(opts: { failFirstPostAfterStoring?: boolean } = {}): {
+  store: FakePost[]
+  deps: IdempotentSendDeps
+  postCalls: () => number
+  findCalls: () => { channel: string; thread: string; key: string }[]
+} {
+  const store: FakePost[] = []
+  const finds: { channel: string; thread: string; key: string }[] = []
+  let postCalls = 0
+  const deps: IdempotentSendDeps = {
+    findDelivered: async (channel, thread, key) => {
+      finds.push({ channel, thread, key })
+      const hit = store.find((m) => m.key === key && m.channel === channel && m.thread === thread)
+      return hit ? `ts-${key}` : null
+    },
+    post: async (ob, key) => {
+      postCalls++
+      store.push({ key, channel: ob.channel, thread: ob.thread, payload: ob.payload })
+      if (opts.failFirstPostAfterStoring && postCalls === 1) {
+        // Message landed at Slack, but the ack never came back.
+        throw Object.assign(new Error('socket hang up'), { code: 'ECONNRESET' })
+      }
+    },
+  }
+  return { store, deps, postCalls: () => postCalls, findCalls: () => finds }
+}
+
+const obFixture: DeliveryObligation = {
+  id: 'd-1',
+  channel: 'C_IDEM',
+  thread: 'T1',
+  payload: 'hello',
+  attempts: 0,
+  state: 'pending',
+  createdAt: 1_700_000_000_000,
+}
+
+describe('deliveryIdempotencyKey (ccsc-o7x.2.3)', () => {
+  test('is deterministic and derived from the obligation id', () => {
+    expect(deliveryIdempotencyKey(obFixture)).toBe('ccsc-reply:d-1')
+    expect(deliveryIdempotencyKey(obFixture)).toBe(deliveryIdempotencyKey({ ...obFixture }))
+  })
+
+  test('distinct ids → distinct keys; same id across threads → same key', () => {
+    expect(deliveryIdempotencyKey({ ...obFixture, id: 'd-2' })).toBe('ccsc-reply:d-2')
+    // The id IS the logical-message identity; channel/thread do not perturb it.
+    expect(deliveryIdempotencyKey({ ...obFixture, channel: 'OTHER', thread: 'X' })).toBe(
+      'ccsc-reply:d-1',
+    )
+  })
+
+  test('the metadata event type is the stable CCSC delivery marker', () => {
+    expect(DELIVERY_METADATA_EVENT_TYPE).toBe('ccsc_reply_delivery')
+  })
+})
+
+describe('makeIdempotentSend (ccsc-o7x.2.3)', () => {
+  test('first delivery posts once under the derived key', async () => {
+    const fake = makeFakeSlack()
+    const send = makeIdempotentSend(fake.deps)
+    await send(obFixture)
+
+    expect(fake.postCalls()).toBe(1)
+    expect(fake.store).toEqual([
+      { key: 'ccsc-reply:d-1', channel: 'C_IDEM', thread: 'T1', payload: 'hello' },
+    ])
+    // The dedup lookup ran first, with the derived key.
+    expect(fake.findCalls()[0]).toEqual({ channel: 'C_IDEM', thread: 'T1', key: 'ccsc-reply:d-1' })
+  })
+
+  test('a replay when the key is already delivered is a no-op (no second post)', async () => {
+    const fake = makeFakeSlack()
+    const send = makeIdempotentSend(fake.deps)
+    await send(obFixture) // posts
+    await send(obFixture) // replay → findDelivered hits → no-op
+
+    expect(fake.postCalls()).toBe(1)
+    expect(fake.store).toHaveLength(1)
+  })
+
+  test('at-most-once under simulated ack loss: posted-then-throws, replay dedups', async () => {
+    const fake = makeFakeSlack({ failFirstPostAfterStoring: true })
+    const send = makeIdempotentSend(fake.deps)
+
+    // First attempt lands the message at Slack but the ack is lost → throws.
+    await expect(send(obFixture)).rejects.toThrow(/socket hang up/)
+    expect(fake.store).toHaveLength(1)
+
+    // The poller would retry. The replay finds the prior post and is a no-op —
+    // the visible message count stays at exactly one.
+    await send(obFixture)
+    expect(fake.postCalls()).toBe(1) // never posted twice
+    expect(fake.store).toHaveLength(1)
+  })
+})
+
+describe('idempotent delivery through the poller (ccsc-o7x.2.3 × 2.2)', () => {
+  let rawRoot: string
+  let tmpRoot: string
+  let nowValue: number
+  const key = { channel: 'C_POLL', thread: 'T1' }
+
+  beforeEach(() => {
+    rawRoot = mkdtempSync(join(tmpdir(), 'supervisor-idem-'))
+    tmpRoot = realpathSync.native(rawRoot)
+    nowValue = 1_700_000_000_000
+  })
+  afterEach(() => {
+    rmSync(rawRoot, { recursive: true, force: true })
+  })
+
+  function makeSupervisor() {
+    return createSessionSupervisor({
+      stateRoot: tmpRoot,
+      log: () => {},
+      clock: () => nowValue,
+      leaseTtlMs: 1000,
+      ownerId: 'OWNER-1',
+    })
+  }
+
+  test('drainOutbox + makeIdempotentSend: ack loss yields exactly one visible delivery', async () => {
+    // Seed a pending obligation for the poller.
+    const seed = makeSupervisor()
+    const h = await seed.activate(key, 'U')
+    await h.recordTerminalDelivery(h.lease!.token, {
+      id: 'd-1',
+      channel: 'C_POLL',
+      thread: 'T1',
+      payload: 'hello',
+    })
+
+    // The first post lands at Slack then throws (ack lost). The poller's in-pass
+    // retry re-sends — but the idempotent wrapper finds the prior post and
+    // no-ops, so the obligation is delivered with exactly one visible message.
+    const fake = makeFakeSlack({ failFirstPostAfterStoring: true })
+    const sup = makeSupervisor()
+    const report = await sup.drainOutbox(makeIdempotentSend(fake.deps), {
+      maxAttempts: 3,
+      delayMs: async () => {},
+    })
+
+    expect(report.delivered).toEqual(['d-1'])
+    expect(report.deadLettered).toEqual([])
+    expect(fake.postCalls()).toBe(1) // posted exactly once despite the retry
+    expect(fake.store).toHaveLength(1)
+
+    const reloaded = await loadSession(tmpRoot, sessionPath(tmpRoot, key))
+    expect(reloaded.outbox?.[0]?.state).toBe('delivered')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Slack delivery adapter — createDeliverySendDeps (ccsc-o7x.3)
+// ---------------------------------------------------------------------------
+
+/** A coherent fake Slack: `chat.postMessage` appends the message (with its
+ *  metadata) to a thread store that `conversations.replies` then returns — so a
+ *  post is visible to a later findDelivered, exactly like the real API. */
+function makeFakeSlackClient(seed: Array<{ ts: string; eventType?: string; key?: string }> = []) {
+  const store: Array<{
+    ts: string
+    metadata?: { event_type?: string; event_payload?: Record<string, unknown> }
+  }> = seed.map((s) => ({
+    ts: s.ts,
+    metadata: s.eventType
+      ? { event_type: s.eventType, event_payload: { idempotency_key: s.key } }
+      : undefined,
+  }))
+  const posted: Array<Record<string, unknown>> = []
+  const repliesCalls: Array<Record<string, unknown>> = []
+  const client = {
+    conversations: {
+      replies: async (args: Record<string, unknown>) => {
+        repliesCalls.push(args)
+        return { messages: store }
+      },
+    },
+    chat: {
+      postMessage: async (args: Record<string, unknown>) => {
+        posted.push(args)
+        const ts = `posted-${posted.length}`
+        store.push({
+          ts,
+          metadata: args.metadata as
+            | { event_type?: string; event_payload?: Record<string, unknown> }
+            | undefined,
+        })
+        return { ts }
+      },
+    },
+  }
+  return {
+    client: client as unknown as Parameters<typeof createDeliverySendDeps>[0],
+    posted,
+    repliesCalls,
+  }
+}
+
+describe('createDeliverySendDeps — Slack adapter (ccsc-o7x.3)', () => {
+  const ob: DeliveryObligation = {
+    id: 'd-1',
+    channel: 'C1',
+    thread: 'T1',
+    payload: 'hello',
+    attempts: 0,
+    state: 'pending',
+    createdAt: 1,
+  }
+
+  test('post stamps the idempotency key into Slack message metadata', async () => {
+    const fake = makeFakeSlackClient()
+    await createDeliverySendDeps(fake.client).post(ob, 'ccsc-reply:d-1')
+    expect(fake.posted).toHaveLength(1)
+    expect(fake.posted[0]).toMatchObject({
+      channel: 'C1',
+      text: 'hello',
+      thread_ts: 'T1',
+      metadata: {
+        event_type: 'ccsc_reply_delivery',
+        event_payload: { idempotency_key: 'ccsc-reply:d-1' },
+      },
+    })
+  })
+
+  test('findDelivered returns the ts when a prior post carries the matching key', async () => {
+    const fake = makeFakeSlackClient([
+      { ts: '111.222', eventType: 'ccsc_reply_delivery', key: 'ccsc-reply:d-1' },
+    ])
+    const deps = createDeliverySendDeps(fake.client)
+    expect(await deps.findDelivered('C1', 'T1', 'ccsc-reply:d-1')).toBe('111.222')
+    // Looked up the thread with metadata included.
+    expect(fake.repliesCalls[0]).toMatchObject({
+      channel: 'C1',
+      ts: 'T1',
+      include_all_metadata: true,
+    })
+  })
+
+  test('findDelivered returns null when no message carries the key (wrong key or no metadata)', async () => {
+    const fake = makeFakeSlackClient([
+      { ts: 'x', eventType: 'ccsc_reply_delivery', key: 'ccsc-reply:OTHER' },
+      { ts: 'y' }, // a plain message, no delivery metadata
+    ])
+    expect(
+      await createDeliverySendDeps(fake.client).findDelivered('C1', 'T1', 'ccsc-reply:d-1'),
+    ).toBeNull()
+  })
+
+  test('findDelivered short-circuits to null without an API call when the thread is empty', async () => {
+    const fake = makeFakeSlackClient()
+    expect(
+      await createDeliverySendDeps(fake.client).findDelivered('C1', '', 'ccsc-reply:d-1'),
+    ).toBeNull()
+    expect(fake.repliesCalls).toHaveLength(0)
+  })
+
+  test('createReplyPoster stamps the key into metadata and returns the resulting ts', async () => {
+    const fake = makeFakeSlackClient()
+    const ts = await createReplyPoster(fake.client)(ob, 'ccsc-reply:d-1')
+    expect(ts).toBe('posted-1')
+    expect(fake.posted[0]).toMatchObject({
+      channel: 'C1',
+      text: 'hello',
+      thread_ts: 'T1',
+      metadata: {
+        event_type: 'ccsc_reply_delivery',
+        event_payload: { idempotency_key: 'ccsc-reply:d-1' },
+      },
+    })
+  })
+})
+
+describe('outbox poller × Slack adapter end-to-end (ccsc-o7x.3)', () => {
+  let rawRoot: string
+  let tmpRoot: string
+  let nowValue: number
+  const key = { channel: 'C_E2E', thread: 'T1' }
+
+  beforeEach(() => {
+    rawRoot = mkdtempSync(join(tmpdir(), 'supervisor-e2e-'))
+    tmpRoot = realpathSync.native(rawRoot)
+    nowValue = 1_700_000_000_000
+  })
+  afterEach(() => {
+    rmSync(rawRoot, { recursive: true, force: true })
+  })
+
+  function makeSupervisor() {
+    return createSessionSupervisor({
+      stateRoot: tmpRoot,
+      log: () => {},
+      clock: () => nowValue,
+      leaseTtlMs: 1000,
+      ownerId: 'OWNER-1',
+    })
+  }
+
+  test('drainOutbox via the real adapter posts once and marks the obligation delivered', async () => {
+    const seed = makeSupervisor()
+    const h = await seed.activate(key, 'U')
+    await h.recordTerminalDelivery(h.lease!.token, {
+      id: 'd-1',
+      channel: key.channel,
+      thread: key.thread,
+      payload: 'hello',
+    })
+
+    const fake = makeFakeSlackClient()
+    const sup = makeSupervisor()
+    const report = await sup.drainOutbox(makeIdempotentSend(createDeliverySendDeps(fake.client)))
+
+    expect(report.delivered).toEqual(['d-1'])
+    expect(fake.posted).toHaveLength(1)
+    expect(fake.posted[0]).toMatchObject({
+      text: 'hello',
+      metadata: {
+        event_type: 'ccsc_reply_delivery',
+        event_payload: { idempotency_key: 'ccsc-reply:d-1' },
+      },
+    })
+    const reloaded = await loadSession(tmpRoot, sessionPath(tmpRoot, key))
+    expect(reloaded.outbox?.[0]?.state).toBe('delivered')
+  })
+
+  test('ack-loss recovery: a pending obligation whose post already landed is deduped, not re-posted', async () => {
+    const seed = makeSupervisor()
+    const h = await seed.activate(key, 'U')
+    await h.recordTerminalDelivery(h.lease!.token, {
+      id: 'd-1',
+      channel: key.channel,
+      thread: key.thread,
+      payload: 'hello',
+    })
+    // Simulate the ack-loss window: the message DID land in the thread under its
+    // key, but the obligation is still pending (the marking write was lost).
+    const fake = makeFakeSlackClient([
+      { ts: '999.000', eventType: 'ccsc_reply_delivery', key: 'ccsc-reply:d-1' },
+    ])
+    const sup = makeSupervisor()
+    const report = await sup.drainOutbox(makeIdempotentSend(createDeliverySendDeps(fake.client)))
+
+    // Delivered (resolved) but NOT re-posted — exactly-once visible delivery.
+    expect(report.delivered).toEqual(['d-1'])
+    expect(fake.posted).toHaveLength(0)
+    const reloaded = await loadSession(tmpRoot, sessionPath(tmpRoot, key))
+    expect(reloaded.outbox?.[0]?.state).toBe('delivered')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Durable single-message reply delivery — deliverReplyDurably (ccsc-o7x.3 pt2)
+// ---------------------------------------------------------------------------
+
+describe('deliverReplyDurably (ccsc-o7x.3 pt2)', () => {
+  let rawRoot: string
+  let tmpRoot: string
+  let nowValue: number
+  const key = { channel: 'C_DUR', thread: 'T1' }
+
+  beforeEach(() => {
+    rawRoot = mkdtempSync(join(tmpdir(), 'supervisor-durable-'))
+    tmpRoot = realpathSync.native(rawRoot)
+    nowValue = 1_700_000_000_000
+  })
+  afterEach(() => {
+    rmSync(rawRoot, { recursive: true, force: true })
+  })
+
+  function makeSupervisor() {
+    return createSessionSupervisor({
+      stateRoot: tmpRoot,
+      log: () => {},
+      clock: () => nowValue,
+      leaseTtlMs: 1000,
+      ownerId: 'OWNER-1',
+    })
+  }
+
+  /** Pre-create the session file so deliverReplyDurably's owner-less activate
+   *  resolves it from disk (mirrors a session the inbound message created). */
+  async function seedSession() {
+    const seed = makeSupervisor()
+    await seed.activate(key, 'U')
+  }
+
+  function slackError(code: string): Error {
+    return Object.assign(new Error(`slack: ${code}`), { data: { ok: false, error: code } })
+  }
+
+  function makePoster(behavior: 'ok' | Error, ts = 'ts-1') {
+    const calls: Array<{ id: string; key: string; text: string }> = []
+    const poster: ReplyPoster = async (obligation, idemKey) => {
+      calls.push({ id: obligation.id, key: idemKey, text: obligation.payload })
+      if (behavior !== 'ok') throw behavior
+      return ts
+    }
+    return { poster, calls }
+  }
+
+  const reply = { id: 'r-1', channel: 'C_DUR', thread: 'T1', text: 'hello' }
+
+  test('success: posts under the obligation key, marks delivered, returns the ts', async () => {
+    await seedSession()
+    const sup = makeSupervisor()
+    const { poster, calls } = makePoster('ok', 'ts-9')
+
+    const result = await deliverReplyDurably({ supervisor: sup, post: poster }, reply)
+
+    expect(result).toEqual({ status: 'delivered', ts: 'ts-9' })
+    // Posted exactly once, under the deterministic idempotency key.
+    expect(calls).toEqual([{ id: 'r-1', key: 'ccsc-reply:r-1', text: 'hello' }])
+    const reloaded = await loadSession(tmpRoot, sessionPath(tmpRoot, key))
+    expect(reloaded.outbox?.[0]).toMatchObject({ id: 'r-1', state: 'delivered', attempts: 1 })
+    // Nothing left pending.
+    expect(await sup.pendingDeliveries()).toHaveLength(0)
+  })
+
+  test('records the obligation BEFORE the send (crash-before-send safe)', async () => {
+    await seedSession()
+    const sup = makeSupervisor()
+    // A poster that asserts the obligation is already persisted as pending at
+    // the moment of the send — proving record happened first.
+    let pendingAtSendTime = -1
+    const poster: ReplyPoster = async () => {
+      const probe = makeSupervisor()
+      pendingAtSendTime = (await probe.pendingDeliveries()).length
+      return 'ts-1'
+    }
+    await deliverReplyDurably({ supervisor: sup, post: poster }, reply)
+    expect(pendingAtSendTime).toBe(1) // obligation was durable before the post returned
+  })
+
+  test('transient error: leaves the obligation pending, returns queued (poller will retry)', async () => {
+    await seedSession()
+    const sup = makeSupervisor()
+    const { poster } = makePoster(slackError('rate_limited'))
+
+    const result = await deliverReplyDurably({ supervisor: sup, post: poster }, reply)
+
+    expect(result).toEqual({ status: 'queued' })
+    const reloaded = await loadSession(tmpRoot, sessionPath(tmpRoot, key))
+    expect(reloaded.outbox?.[0]).toMatchObject({ id: 'r-1', state: 'pending', attempts: 1 })
+    // Still pending → the poller picks it up (attempts>0 → findDelivered dedups).
+    expect((await sup.pendingDeliveries()).map((o) => o.id)).toEqual(['r-1'])
+  })
+
+  test('non-retryable error: marks dead with the error recorded, then rethrows', async () => {
+    await seedSession()
+    const sup = makeSupervisor()
+    const { poster } = makePoster(slackError('channel_not_found'))
+
+    await expect(deliverReplyDurably({ supervisor: sup, post: poster }, reply)).rejects.toThrow(
+      /channel_not_found/,
+    )
+    const reloaded = await loadSession(tmpRoot, sessionPath(tmpRoot, key))
+    expect(reloaded.outbox?.[0]).toMatchObject({
+      id: 'r-1',
+      state: 'dead',
+      attempts: 1,
+      lastError: 'channel_not_found',
+    })
+    // Dead, not pending → the poller leaves it alone.
+    expect(await sup.pendingDeliveries()).toHaveLength(0)
+  })
+
+  test('throws DurableUnavailableError (records nothing) when the session cannot be activated', async () => {
+    // No seedSession() — the session file does not exist, and durable delivery
+    // activates without an owner, so activate rejects.
+    const sup = makeSupervisor()
+    const { poster, calls } = makePoster('ok')
+
+    await expect(
+      deliverReplyDurably({ supervisor: sup, post: poster }, reply),
+    ).rejects.toBeInstanceOf(DurableUnavailableError)
+    expect(calls).toHaveLength(0) // never attempted a send
+  })
+})
+
+// ---------------------------------------------------------------------------
 // SessionSupervisor.quiesce — 000-docs/session-state-machine.md §119-124, §266
 // ---------------------------------------------------------------------------
 
@@ -5543,11 +7464,11 @@ describe('JournalEvent', () => {
     // 31-A.5) + manifest.publish (Epic 31-B.1/.3) + system.key_rotation
     // (ccsc-22l) + policy.deny.context_stripped (ccsc-06s) +
     // 5 admin.* kinds (ccsc-3w0) + system.stream_finalize (ccsc-ele) +
-    // 4 admin.mute/unmute kinds (ccsc-gjm: admin.mute, admin.mute.denied,
-    // admin.unmute, admin.unmute.denied) + 2 fork-only user-token kinds
-    // (gate.user_token.read, gate.user_token.deny). If this number
-    // drifts, update the doc count in journal.ts's header comment too.
-    expect(kinds).toHaveLength(36)
+    // 4 admin.mute/unmute kinds (ccsc-gjm) + 2 session.recovery.* kinds
+    // (ccsc-o7x.1.2) + 2 fork-only user-token kinds (gate.user_token.read,
+    // gate.user_token.deny). If this number drifts, update the doc count in
+    // journal.ts's header comment too.
+    expect(kinds).toHaveLength(38)
     expect(kinds).toContain('manifest.read')
     expect(kinds).toContain('manifest.read.cached')
     expect(kinds).toContain('manifest.publish')
@@ -5563,6 +7484,8 @@ describe('JournalEvent', () => {
     expect(kinds).toContain('admin.mute.denied')
     expect(kinds).toContain('admin.unmute')
     expect(kinds).toContain('admin.unmute.denied')
+    expect(kinds).toContain('session.recovery.requeued')
+    expect(kinds).toContain('session.recovery.orphaned')
     expect(kinds).toContain('gate.user_token.read')
     expect(kinds).toContain('gate.user_token.deny')
     for (const k of kinds) {
@@ -8905,6 +10828,9 @@ describe('Supervisor wiring (ccsc-jqs)', () => {
       deactivate: async () => {},
       clearQuarantine: () => {},
       reapIdle: async () => {},
+      recoverOnStartup: async () => ({ scanned: 0, requeued: [], orphaned: [] }),
+      pendingDeliveries: async () => [],
+      drainOutbox: async () => ({ scanned: 0, delivered: [], deadLettered: [], skipped: [] }),
       shutdown: () => {
         shutdownCalled = true
         return new Promise<void>((res) => {
@@ -10316,6 +12242,315 @@ describe('detectShadowing (ccsc-4g8) — backward compatibility', () => {
     ]
     const warnings = detectShadowingDirect(rules)
     expect(warnings.filter((w) => w.crossTier === true)).toEqual([])
+  })
+})
+
+// ---------------------------------------------------------------------------
+// policy.ts mutation-survivor kills (ccsc-2et)
+// ---------------------------------------------------------------------------
+//
+// Targets the real surviving mutants from the CI Mutation run that dropped
+// policy.ts to 73.91% (000-docs/MUTATION_REPORT.md, 2026-05-31). Survivors
+// were extracted from the json reporter's mutation.json (ccsc-2et). The
+// v0.10 tier-aware rewrite (ccsc-8pw / ccsc-4g8) added decision branches to
+// matchesIntersect / matchSubsetOrEqual / evaluate without enough
+// negative-path + boundary + exact-message assertions. Each test below names
+// the source line(s) and mutator family it kills so a future reader can map
+// the assertion back to the survivor it was written for.
+
+describe('matchesIntersect — field-boundary survivor kills (ccsc-2et)', () => {
+  // Lines 695/696/700: `a.X !== undefined && b.X !== undefined && a.X !== b.X`.
+  // Existing tests only exercised tool-equal-both-sides; the ConditionalExpression,
+  // EqualityOperator, and LogicalOperator mutants on the tool/channel/actor
+  // guards survived because no test drove "both set and DIFFER" or "one side only".
+
+  test('different tool on both sides — non-intersecting (line 695)', () => {
+    // Kills 695 `a.tool !== b.tool` → `===` and the conditional → true mutant.
+    expect(matchesIntersect({ tool: 'Bash' }, { tool: 'Write' })).toBe(false)
+  })
+
+  test('tool only on one side — intersects (line 695 undefined guards)', () => {
+    // Kills the `a.tool !== undefined && b.tool !== undefined` → `||` logical
+    // mutant: with b.tool unset the && short-circuits (no false-return), but the
+    // || mutant would proceed to `a.tool !== b.tool` (Bash !== undefined) → false.
+    expect(matchesIntersect({ tool: 'Bash' }, { channel: 'C001' })).toBe(true)
+  })
+
+  test('different channel on both sides — non-intersecting (line 696)', () => {
+    expect(
+      matchesIntersect({ tool: 'Bash', channel: 'C001' }, { tool: 'Bash', channel: 'C002' }),
+    ).toBe(false)
+  })
+
+  test('channel only on one side — intersects (line 696 undefined guards)', () => {
+    expect(matchesIntersect({ channel: 'C001' }, { tool: 'Bash' })).toBe(true)
+  })
+
+  test('different actor on both sides — non-intersecting (line 700)', () => {
+    expect(
+      matchesIntersect(
+        { tool: 'Bash', actor: 'session_owner' },
+        { tool: 'Bash', actor: 'claude_process' },
+      ),
+    ).toBe(false)
+  })
+
+  test('actor only on one side — intersects (line 700 undefined guards)', () => {
+    expect(matchesIntersect({ actor: 'session_owner' }, { tool: 'Bash' })).toBe(true)
+  })
+
+  test('pathPrefix only on one side — intersects (line 702 `&&` → `||`)', () => {
+    // Kills 702 `a.pathPrefix !== undefined && b.pathPrefix !== undefined` → `||`:
+    // with b unset the && skips the block (return true); the || mutant enters and
+    // dereferences b.pathPrefix.startsWith → throws / wrong-answer.
+    expect(matchesIntersect({ tool: 'Write', pathPrefix: '/home/a' }, { tool: 'Write' })).toBe(true)
+  })
+
+  test('a is the longer pathPrefix, b is its prefix — intersects (line 705)', () => {
+    // The existing "one prefixes the other" test put the SHORTER path in `a`,
+    // so the `!a.startsWith(b + sep)` clause on line 705 was always vacuously
+    // true and its ArithmeticOperator (`b.pathPrefix - sep`) and MethodExpression
+    // (`startsWith` → `endsWith`) mutants survived. Reversing the order makes
+    // line 705 the load-bearing clause.
+    expect(
+      matchesIntersect(
+        { tool: 'Write', pathPrefix: '/home/jeremy/projects' },
+        { tool: 'Write', pathPrefix: '/home/jeremy' },
+      ),
+    ).toBe(true)
+  })
+})
+
+describe('matchSubsetOrEqual via detectShadowing — within-tier subset survivor kills (ccsc-2et)', () => {
+  // matchSubsetOrEqual is private; it is reached through detectShadowing's
+  // Pass-1 within-tier subset check (default-tier rules, broader rule first).
+  // Lines 648 (actor), 650-657 (pathPrefix), 661-664 (argEquals) had
+  // Equality/Conditional/Logical/Method/Arithmetic survivors because the
+  // existing corpus exercised only the tool+channel subset path.
+
+  const withinTier = (earlier: Record<string, unknown>, later: Record<string, unknown>): number => {
+    const rules = [
+      { id: 'earlier', priority: 100, effect: 'auto_approve', match: earlier },
+      { id: 'later', priority: 100, effect: 'auto_approve', match: later },
+    ] as PolicyRule[]
+    return detectShadowingDirect(rules).filter((w) => !w.crossTier).length
+  }
+
+  // ── actor (line 648) ──
+  test('equal actor → earlier shadows later (line 648 `!==` → `===`)', () => {
+    expect(
+      withinTier(
+        { tool: 'Bash', actor: 'session_owner' },
+        { tool: 'Bash', actor: 'session_owner' },
+      ),
+    ).toBe(1)
+  })
+
+  test('different actor → no shadow (line 648 EqualityOperator)', () => {
+    expect(
+      withinTier(
+        { tool: 'Bash', actor: 'session_owner' },
+        { tool: 'Bash', actor: 'claude_process' },
+      ),
+    ).toBe(0)
+  })
+
+  // ── pathPrefix (lines 650-657) ──
+  test('earlier path is a prefix of later → shadow (lines 654-655)', () => {
+    expect(
+      withinTier({ tool: 'Write', pathPrefix: '/home' }, { tool: 'Write', pathPrefix: '/home/x' }),
+    ).toBe(1)
+  })
+
+  test('earlier constrains pathPrefix, later does not → no shadow (line 651)', () => {
+    // Kills the `inner.pathPrefix === undefined` → conditional/false mutant.
+    expect(withinTier({ tool: 'Write', pathPrefix: '/home' }, { tool: 'Write' })).toBe(0)
+  })
+
+  test('disjoint pathPrefixes → no shadow (lines 654-655 startsWith/+sep)', () => {
+    expect(
+      withinTier(
+        { tool: 'Write', pathPrefix: '/home/a' },
+        { tool: 'Write', pathPrefix: '/home/b' },
+      ),
+    ).toBe(0)
+  })
+
+  // ── argEquals (lines 661-664) ──
+  test('equal argEquals → shadow (line 664 jsonEqual true path)', () => {
+    expect(
+      withinTier(
+        { tool: 'Bash', argEquals: { cmd: 'ls' } },
+        { tool: 'Bash', argEquals: { cmd: 'ls' } },
+      ),
+    ).toBe(1)
+  })
+
+  test('earlier constrains argEquals, later does not → no shadow (line 662)', () => {
+    expect(withinTier({ tool: 'Bash', argEquals: { cmd: 'ls' } }, { tool: 'Bash' })).toBe(0)
+  })
+
+  test('argEquals value disagreement → no shadow (line 664 jsonEqual false path)', () => {
+    expect(
+      withinTier(
+        { tool: 'Bash', argEquals: { cmd: 'ls' } },
+        { tool: 'Bash', argEquals: { cmd: 'rm' } },
+      ),
+    ).toBe(0)
+  })
+})
+
+describe('policy warning/decision exact-text + boundary survivor kills (ccsc-2et)', () => {
+  test('within-tier shadow message is exact (line 608 StringLiteral)', async () => {
+    const { detectShadowing } = await import('./policy.ts')
+    const rules = [
+      { id: 'r1', priority: 100, effect: 'auto_approve', match: { tool: 'Bash' } },
+      { id: 'r2', priority: 100, effect: 'auto_approve', match: { tool: 'Bash', channel: 'C001' } },
+    ] as PolicyRule[]
+    const warnings = detectShadowing(rules)
+    expect(warnings).toHaveLength(1)
+    expect(warnings[0]!.message).toBe(
+      "rule 'r2' is shadowed by earlier rule 'r1' — every call the later rule would match is already caught by the earlier one",
+    )
+  })
+
+  test('checkMonotonicity violation message is exact (line 765 StringLiteral)', async () => {
+    const { checkMonotonicity } = await import('./policy.ts')
+    const prev = [
+      {
+        id: 'deny-all',
+        priority: 100,
+        effect: 'deny',
+        reason: 'x',
+        match: { tool: 'upload_file' },
+      },
+    ] as PolicyRule[]
+    const next = [
+      {
+        id: 'deny-all',
+        priority: 100,
+        effect: 'deny',
+        reason: 'x',
+        match: { tool: 'upload_file' },
+      },
+      {
+        id: 'allow-pdf',
+        priority: 100,
+        effect: 'auto_approve',
+        match: { tool: 'upload_file', argEquals: { mime: 'pdf' } },
+      },
+    ] as PolicyRule[]
+    const violations = checkMonotonicity(prev, next)
+    expect(violations).toHaveLength(1)
+    expect(violations[0]!.message).toBe(
+      "new auto_approve rule 'allow-pdf' weakens existing deny 'deny-all' — reload refused",
+    )
+  })
+
+  test('detectBroadAutoApprove message is exact (lines 811-813 StringLiterals)', async () => {
+    const { detectBroadAutoApprove } = await import('./policy.ts')
+    const rules = [
+      {
+        id: 'too-broad',
+        priority: 100,
+        effect: 'auto_approve',
+        match: { actor: 'claude_process' },
+      },
+    ] as PolicyRule[]
+    const warnings = detectBroadAutoApprove(rules)
+    expect(warnings).toHaveLength(1)
+    expect(warnings[0]!.message).toBe(
+      "auto_approve rule 'too-broad' has no 'tool' or 'pathPrefix' in its match — " +
+        'this rule auto-approves ANY tool call within its scope, which is almost always ' +
+        'a misconfiguration. Narrow the rule or convert to require_approval.',
+    )
+  })
+
+  test('admin auto_approve vs admin deny produces no cross-tier warning (line 624 `=== admin`)', async () => {
+    // Pass-2 skips lower-tier auto_approve only AFTER the `effectiveTier === 'admin'`
+    // continue. The StringLiteral mutant ('admin' → "") would stop skipping admin
+    // rules and wrongly emit a cross-tier warning for an admin/admin pair.
+    const { detectShadowing } = await import('./policy.ts')
+    const rules = [
+      {
+        id: 'admin-deny',
+        priority: 100,
+        effect: 'deny',
+        reason: 'locked',
+        match: { tool: 'Bash', tier: 'admin' },
+      },
+      {
+        id: 'admin-allow',
+        priority: 100,
+        effect: 'auto_approve',
+        match: { tool: 'Bash', tier: 'admin' },
+      },
+    ] as PolicyRule[]
+    const warnings = detectShadowing(rules)
+    expect(warnings.filter((w) => w.crossTier === true)).toEqual([])
+  })
+
+  test('approval exactly at expiry millisecond does NOT allow (line 427 `>` → `>=`)', async () => {
+    const { evaluate, approvalKey } = await import('./policy.ts')
+    const rules = [
+      {
+        id: 'r1',
+        priority: 100,
+        effect: 'require_approval',
+        ttlMs: 60_000,
+        match: { tool: 'reply' },
+      },
+    ] as PolicyRule[]
+    // now === ttlExpires === 1000: `ttlExpires > now` is false (expired), so the
+    // decision must be `require`. The `>=` mutant would flip this to `allow`.
+    const approvals = new Map([
+      [approvalKey('r1', { channel: 'C_CHAN', thread: 'T1.0' }), { ttlExpires: 1_000 }],
+    ])
+    const decision = evaluate(
+      {
+        tool: 'reply',
+        input: {},
+        sessionKey: { channel: 'C_CHAN', thread: 'T1.0' },
+        actor: 'claude_process',
+      },
+      rules,
+      1_000,
+      { approvals },
+    )
+    expect(decision.kind).toBe('require')
+  })
+
+  test('checkMonotonicity only compares against existing DENY rules (line 752 `.filter`)', async () => {
+    // A broad auto_approve in prev + a narrower auto_approve added in next must
+    // NOT be a violation — only deny-weakening is. The `.filter(deny)` → bare
+    // `prev` mutant would compare the new rule against the prev auto_approve and
+    // emit a false violation.
+    const { checkMonotonicity } = await import('./policy.ts')
+    const prev = [
+      { id: 'broad-allow', priority: 100, effect: 'auto_approve', match: { tool: 'Bash' } },
+    ] as PolicyRule[]
+    const next = [
+      { id: 'broad-allow', priority: 100, effect: 'auto_approve', match: { tool: 'Bash' } },
+      {
+        id: 'new-allow',
+        priority: 100,
+        effect: 'auto_approve',
+        match: { tool: 'Bash', channel: 'C001' },
+      },
+    ] as PolicyRule[]
+    expect(checkMonotonicity(prev, next)).toEqual([])
+  })
+
+  test('policyDigest is independent of authoring order (line 548 sort comparator)', async () => {
+    // The sort-by-id comparator makes the digest a content fingerprint, not an
+    // order fingerprint. A comparator that always returns 0 (ConditionalExpression
+    // mutants) would leave the array in input order → different digests.
+    const { policyDigest } = await import('./policy.ts')
+    const a = { id: 'aaa', priority: 100, effect: 'auto_approve', match: { tool: 'Bash' } }
+    const b = { id: 'bbb', priority: 100, effect: 'deny', reason: 'x', match: { tool: 'Write' } }
+    const rulesAB = [a, b] as PolicyRule[]
+    const rulesBA = [b, a] as PolicyRule[]
+    expect(policyDigest(rulesAB)).toBe(policyDigest(rulesBA))
   })
 })
 

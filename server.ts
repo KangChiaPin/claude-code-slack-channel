@@ -1,4 +1,5 @@
 #!/usr/bin/env bun
+import { randomUUID } from 'node:crypto'
 import {
   chmodSync,
   existsSync,
@@ -16,7 +17,7 @@ import { basename, join, resolve } from 'node:path'
  * Two-way Slack ↔ Claude Code bridge via Socket Mode + MCP stdio.
  * Security: gate layer, outbound gate, file exfiltration guard, prompt hardening.
  *
- * SPDX-License-Identifier: MIT
+ * SPDX-License-Identifier: Apache-2.0
  */
 import { Server } from '@modelcontextprotocol/sdk/server/index.js'
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
@@ -32,6 +33,8 @@ import {
   AUDIT_RECEIPTS_MAX,
   assertPublishAllowed,
   buildAndPostAuditReceipt,
+  buildSecretPlaceholderMap,
+  buildSecretValueSet,
   chunkText,
   decidePermissionRoute,
   defaultAccess,
@@ -45,11 +48,13 @@ import {
   isDuplicateEvent,
   isSlackFileUrl,
   LIST_SESSIONS_MAX,
+  assertNoSecretValues as libAssertNoSecretValues,
   assertOutboundAllowed as libAssertOutboundAllowed,
   assertSendable as libAssertSendable,
   deliveredThreadKey as libDeliveredThreadKey,
   gate as libGate,
   listSessions as libListSessions,
+  makeIdempotentSend,
   PERMISSION_REPLY_RE,
   type PendingPolicyApproval,
   parseSendableRoots,
@@ -57,6 +62,7 @@ import {
   permissionPairingKey as permKey,
   pruneExpired,
   recordApprovalVote,
+  redactSecretValues,
   resolveJournalPath,
   type SenderRole,
   sanitizeDisplayName,
@@ -88,6 +94,12 @@ import {
   policyDigest,
   evaluate as policyEvaluate,
 } from './policy.ts'
+import {
+  createDeliverySendDeps,
+  createReplyPoster,
+  DurableUnavailableError,
+  deliverReplyDurably,
+} from './slack-delivery.ts'
 import { streamReply } from './stream-reply.ts'
 
 // ---------------------------------------------------------------------------
@@ -208,7 +220,13 @@ function writeRoleHookFileAtomic(filePath: string, role: SenderRole): void {
 mkdirSync(STATE_DIR, { recursive: true })
 mkdirSync(INBOX_DIR, { recursive: true })
 
-function loadEnv(): { botToken: string; appToken: string; userToken: string } {
+function loadEnv(): {
+  botToken: string
+  appToken: string
+  userToken: string
+  secretValues: Set<string>
+  secretPlaceholders: Map<string, string>
+} {
   if (!existsSync(ENV_FILE)) {
     console.error(
       `[slack] No .env found at ${ENV_FILE}\n` +
@@ -256,10 +274,22 @@ function loadEnv(): { botToken: string; appToken: string; userToken: string } {
     process.exit(1)
   }
 
-  return { botToken, appToken, userToken }
+  // ccsc-z0n.3 — build the live-secret-value set the outbound value-exfiltration
+  // guard blocks. Derived from the SECRET_DECLARATIONS table (ccsc-z0n.1) by
+  // resolving each declaration's env var against the parsed .env, so adding a
+  // secret means adding a table row and nothing here changes.
+  const secretValues = buildSecretValueSet((d) => vars[d.envVar])
+
+  // ccsc-z0n.2 — live-value → placeholder map for the inbound tool-result scrub.
+  // Same declaration-driven derivation; the agent sees a secret's stable
+  // placeholder if a live value ever surfaces in a result (defense-in-depth —
+  // the process boundary already keeps tokens out of agent-readable surfaces).
+  const secretPlaceholders = buildSecretPlaceholderMap((d) => vars[d.envVar])
+
+  return { botToken, appToken, userToken, secretValues, secretPlaceholders }
 }
 
-const { botToken, appToken, userToken } = loadEnv()
+const { botToken, appToken, userToken, secretValues, secretPlaceholders } = loadEnv()
 
 // ---------------------------------------------------------------------------
 // Slack clients
@@ -573,6 +603,13 @@ function assertSendable(filePath: string): void {
   libAssertSendable(filePath, resolve(INBOX_DIR), SENDABLE_ROOTS, STATE_DIR)
 }
 
+/** ccsc-z0n.3 — value-exfiltration guard bound to this process's live secret
+ *  values. Composes with assertSendable: that blocks secret *files* by path,
+ *  this blocks secret *values* by content (message text, file body). */
+function assertNoSecretValues(payload: string): void {
+  libAssertNoSecretValues(payload, secretValues)
+}
+
 // ---------------------------------------------------------------------------
 // Security — outbound gate
 // ---------------------------------------------------------------------------
@@ -614,6 +651,12 @@ let supervisor: SessionSupervisor | null = null
 /** Interval handle for the idle reaper tick. Stored so it can be cleared
  *  before supervisor.shutdown() during graceful exit. */
 let reaperTimer: ReturnType<typeof setInterval> | null = null
+
+/** Interval handle for the outbox delivery poller tick (ccsc-o7x.3). Drains
+ *  pending reply-delivery obligations (replies a crash or a transient Slack
+ *  failure left undelivered) with idempotent retry. Stored so it can be cleared
+ *  before supervisor.shutdown() during graceful exit, exactly like reaperTimer. */
+let deliveryTimer: ReturnType<typeof setInterval> | null = null
 
 // Track last active channel/thread for permission relay
 let lastActiveChannel = ''
@@ -1135,7 +1178,7 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: 'list_sessions',
       description:
-        'List active per-thread sessions on this host: (channel, thread, ownerId, createdAt, lastActiveAt). Does NOT return session body/conversation state — operators get a thread inventory only.',
+        'List active per-thread sessions on this host: (channel, thread, ownerId, createdAt, lastActiveAt). Does NOT return session body/conversation state — operators get a thread inventory only. (Companion tool: for governance across multiple agent runtimes beyond this Slack bridge, see agent-governance-plane (AGP), which builds on this substrate.)',
       inputSchema: {
         type: 'object' as const,
         properties: {},
@@ -1197,6 +1240,7 @@ interface ToolContext {
   botToken: string
   assertOutboundAllowed: (chatId: string, threadTs: string | undefined) => void
   assertSendable: (filePath: string) => void
+  assertNoSecretValues: (payload: string) => void
   journalWrite: (input: Parameters<import('./journal.ts').JournalWriter['writeEvent']>[0]) => void
   getAccess: () => import('./lib.ts').Access
   resolveUserName: (userId: string) => Promise<string>
@@ -1215,6 +1259,25 @@ type ToolResult = { content: Array<{ type: string; text: string }>; isError?: bo
 // ---------------------------------------------------------------------------
 // Per-tool handler functions
 // ---------------------------------------------------------------------------
+
+/** ccsc-z0n.3 — run the value-exfiltration guard over an outbound payload,
+ *  journaling an `exfil.block` (reason names the value-guard, NEVER the value
+ *  or the payload) and rethrowing on a hit. Mirrors the assertSendable block
+ *  path in executeReplyFileUploads so text leaks and file-path leaks land in
+ *  the journal the same way. */
+function guardOutboundSecretValues(payload: string, toolName: string, ctx: ToolContext): void {
+  try {
+    ctx.assertNoSecretValues(payload)
+  } catch (secretErr) {
+    ctx.journalWrite({
+      kind: 'exfil.block',
+      outcome: 'deny',
+      toolName,
+      reason: secretErr instanceof Error ? secretErr.message : String(secretErr),
+    })
+    throw secretErr
+  }
+}
 
 // -----------------------------------------------------------------------
 // reply
@@ -1247,6 +1310,20 @@ async function executeReplyFileUploads(
       throw exfilErr
     }
     const resolved = resolve(filePath)
+    // ccsc-z0n.3 — value-exfiltration guard on file *content*: assertSendable
+    // blocked secret files by path; this blocks a live secret value embedded in
+    // an otherwise-allowlisted file's body. Read as latin1 so every byte maps
+    // 1:1 to a character (a token is ASCII; no decode can split or drop it).
+    // The filename is checked too — an attacker who can't put the token in the
+    // body might smuggle it as the name.
+    let body: string
+    try {
+      body = readFileSync(resolved, 'latin1')
+    } catch {
+      body = '' // unreadable here → filesUploadV2 surfaces the real error
+    }
+    guardOutboundSecretValues(body, 'reply', ctx)
+    guardOutboundSecretValues(basename(resolved), 'reply', ctx)
     const uploadArgs: Record<string, any> = {
       channel_id: chatId,
       file: resolved,
@@ -1342,6 +1419,49 @@ async function executeReplyStreamingPath(opts: {
   }
 }
 
+/** ccsc-o7x.3 — durable single-message reply path. Records a durable obligation
+ *  before the send and lets the background poller redeliver on a transient
+ *  failure or a crash (ADR-002 addendum, Option A). The caller (`executeReply`)
+ *  has already journaled `gate.outbound.allow` and gated this to the single-
+ *  message case (no stream/files, fits one chunk, has a thread). Throws
+ *  `DurableUnavailableError` (before any record/send) when the session can't go
+ *  durable — the caller then falls back to the direct send. A non-retryable
+ *  Slack error propagates (the obligation is marked dead inside
+ *  `deliverReplyDurably`). Extracted to keep `executeReply`'s CRAP score down. */
+async function executeReplyDurablePath(opts: {
+  chatId: string
+  threadTs: string
+  text: string
+  ctx: ToolContext
+}): Promise<ToolResult> {
+  const { chatId, threadTs, text, ctx } = opts
+  if (supervisor === null) throw new DurableUnavailableError('supervisor not started')
+
+  const result = await deliverReplyDurably(
+    { supervisor, post: createReplyPoster(ctx.web) },
+    { id: randomUUID(), channel: chatId, thread: threadTs, text },
+  )
+
+  if (result.status === 'delivered') {
+    return {
+      content: [
+        {
+          type: 'text',
+          text: `Sent 1 message to ${chatId}${result.ts ? ` [ts: ${result.ts}]` : ''}`,
+        },
+      ],
+    }
+  }
+  return {
+    content: [
+      {
+        type: 'text',
+        text: `Queued for delivery to ${chatId} (transient Slack error; the delivery poller will retry until it lands)`,
+      },
+    ],
+  }
+}
+
 async function executeReply(args: Record<string, any>, ctx: ToolContext): Promise<ToolResult> {
   const chatId: string = args.chat_id
   const text: string = args.text
@@ -1371,6 +1491,11 @@ async function executeReply(args: Record<string, any>, ctx: ToolContext): Promis
     throw outboundErr
   }
 
+  // ccsc-z0n.3 — value-exfiltration guard on the reply text. Runs BEFORE the
+  // streaming/non-streaming branch (so both paths are covered) and before the
+  // gate.outbound.allow event (a blocked send was never allowed).
+  guardOutboundSecretValues(text, 'reply', ctx)
+
   const access = ctx.getAccess()
   const limit = access.textChunkLimit || ctx.DEFAULT_CHUNK_LIMIT
   const mode = access.chunkMode || 'newline'
@@ -1381,7 +1506,8 @@ async function executeReply(args: Record<string, any>, ctx: ToolContext): Promis
     return executeReplyStreamingPath({ chatId, threadTs, text, files, limit, ctx })
   }
 
-  // Non-streaming path — existing behavior unchanged.
+  // Non-streaming path. The gate.outbound.allow is journaled once here and
+  // shared by both the durable and the direct sub-paths below.
   ctx.journalWrite({
     kind: 'gate.outbound.allow',
     outcome: 'allow',
@@ -1389,6 +1515,29 @@ async function executeReply(args: Record<string, any>, ctx: ToolContext): Promis
     sessionKey: threadTs !== undefined ? { channel: chatId, thread: threadTs } : undefined,
     input: { channel: chatId, thread_ts: threadTs },
   })
+
+  // ccsc-o7x.3 — durable single-message path (ADR-002 addendum, Option A). Only
+  // the shape where one obligation = one Slack message: no stream, no files,
+  // fits one chunk, has a thread, and the supervisor is up. Records the reply as
+  // a durable obligation so a transient Slack failure or a crash is retried by
+  // the delivery poller instead of lost. Falls back to the direct send below if
+  // the session can't go durable (DurableUnavailableError). Chunked / file /
+  // streaming replies are deliberately NOT routed here (ccsc-o7x.4/.5/.6).
+  if (
+    !stream &&
+    (!files || files.length === 0) &&
+    threadTs !== undefined &&
+    supervisor !== null &&
+    text.length <= limit
+  ) {
+    try {
+      return await executeReplyDurablePath({ chatId, threadTs, text, ctx })
+    } catch (durableErr) {
+      if (!(durableErr instanceof DurableUnavailableError)) throw durableErr
+      // Session couldn't go durable — fall through to the best-effort direct
+      // send (the allow event above already stands).
+    }
+  }
 
   const chunks = chunkText(text, limit, mode)
 
@@ -1488,6 +1637,9 @@ async function executeEditMessage(
     })
     throw outboundErr
   }
+  // ccsc-z0n.3 — value-exfiltration guard on the edited text, before the
+  // gate.outbound.allow event (a blocked edit was never allowed).
+  guardOutboundSecretValues(args.text, 'edit_message', ctx)
   ctx.journalWrite({
     kind: 'gate.outbound.allow',
     outcome: 'allow',
@@ -2519,6 +2671,33 @@ const toolHandlers: Record<string, ToolHandler> = {
   publish_manifest: executePublishManifest,
 }
 
+/** ccsc-z0n.2 — inbound (tool-result → agent) defense-in-depth scrub. Every
+ *  tool result flows back to the Claude process through here; if a declared
+ *  secret value ever surfaces in one (it cannot today — tokens live only in
+ *  this bridge process and never enter a result — but a future tool/refactor
+ *  could regress), swap it for its placeholder BEFORE the agent reads it and
+ *  journal the near-miss. The scrub touches only `content[].text`; the reason
+ *  names the tool and the count, NEVER the value. Returns the result unchanged
+ *  in the common (clean) case. */
+function scrubToolResult(result: ToolResult, toolName: string): ToolResult {
+  if (secretPlaceholders.size === 0 || !Array.isArray(result.content)) return result
+  let totalRedacted = 0
+  const content = result.content.map((part) => {
+    if (part?.type !== 'text' || typeof part.text !== 'string') return part
+    const { text, redactedCount } = redactSecretValues(part.text, secretPlaceholders)
+    totalRedacted += redactedCount
+    return redactedCount > 0 ? { ...part, text } : part
+  })
+  if (totalRedacted === 0) return result
+  journalWrite({
+    kind: 'exfil.block',
+    outcome: 'deny',
+    toolName,
+    reason: `scrubbed ${totalRedacted} declared secret value(s) from tool result before returning to agent`,
+  })
+  return { ...result, content }
+}
+
 mcp.setRequestHandler(CallToolRequestSchema, async (request) => {
   const { name } = request.params
   let args = (request.params.arguments || {}) as Record<string, any>
@@ -2560,6 +2739,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (request) => {
       botToken,
       assertOutboundAllowed,
       assertSendable,
+      assertNoSecretValues,
       journalWrite,
       getAccess,
       resolveUserName,
@@ -2571,7 +2751,9 @@ mcp.setRequestHandler(CallToolRequestSchema, async (request) => {
       INBOX_DIR,
       DEFAULT_CHUNK_LIMIT,
     }
-    return handler(args, ctx)
+    // ccsc-z0n.2 — scrub the result of any declared secret value before it
+    // crosses back to the agent (defense-in-depth; see scrubToolResult).
+    return scrubToolResult(await handler(args, ctx), name)
   }
   return {
     content: [{ type: 'text', text: `Unknown tool: ${name}` }],
@@ -3839,6 +4021,15 @@ async function shutdown(reason: string, code = 0): Promise<void> {
     reaperTimer = null
   }
 
+  // Stop the outbox delivery poller too, for the same reason (ccsc-o7x.3): a
+  // drainOutbox tick must not race the supervisor's quiesce-all pass. Any
+  // obligations still pending are durable on disk and the next process boot
+  // drains them.
+  if (deliveryTimer !== null) {
+    clearInterval(deliveryTimer)
+    deliveryTimer = null
+  }
+
   // Drain in-flight session writes before exiting. This ensures that any
   // handle.update() in progress completes its atomic save rather than
   // leaving a half-written tmp file. Failures are non-fatal — better to
@@ -4054,6 +4245,35 @@ async function main(): Promise<void> {
   // Don't hold the event loop open on the reaper tick alone — the socket and
   // MCP transport already keep the process alive while active.
   if (typeof reaperTimer.unref === 'function') reaperTimer.unref()
+
+  // Outbox delivery poller (ccsc-o7x.3): drain pending reply-delivery
+  // obligations — replies a crash or a transient Slack failure left
+  // undelivered — with idempotent retry / dead-letter. The boot-time drain
+  // recovers obligations the previous process left pending (crash recovery for
+  // replies); the interval is the steady-state retry. Mirrors reaperTimer:
+  // unref'd, and cleared on shutdown before the supervisor drain. The send is
+  // idempotent (lib.ts `makeIdempotentSend` over the Slack adapter), so a
+  // redelivery after a lost ack never double-posts.
+  const idempotentSend = makeIdempotentSend(createDeliverySendDeps(web))
+  const drainOutboxOnce = (): void => {
+    void supervisor!
+      .drainOutbox(idempotentSend)
+      .then((report) => {
+        if (report.deadLettered.length > 0) {
+          console.error('[slack] outbox: dead-lettered obligations', report.deadLettered)
+        }
+      })
+      .catch((err) => {
+        console.error('[slack] outbox drain failed:', err instanceof Error ? err.message : err)
+      })
+  }
+  const deliveryPollMs = (() => {
+    const raw = Number(process.env.SLACK_DELIVERY_POLL_MS)
+    return Number.isFinite(raw) && raw > 0 ? Math.floor(raw) : 15_000
+  })()
+  drainOutboxOnce() // boot-time recovery of crash-pending obligations
+  deliveryTimer = setInterval(drainOutboxOnce, deliveryPollMs)
+  if (typeof deliveryTimer.unref === 'function') deliveryTimer.unref()
 
   // Resolve bot identity (user ID, bot ID, app ID) for mention detection
   // and self-echo filtering across payload variants and multi-workspace setups
