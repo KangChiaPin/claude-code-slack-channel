@@ -1884,6 +1884,102 @@ export function stripBotMention(text: string, botUserId: string): string {
 }
 
 // ---------------------------------------------------------------------------
+// Slack `attachments[]` flattening
+// ---------------------------------------------------------------------------
+
+/** Per-attachment character cap for content injected into the trusted
+ *  Claude-inbound text stream. A forwarded book or paste-bomb otherwise
+ *  becomes an unbounded prompt-injection surface. */
+export const ATTACHMENT_PER_CAP = 2000
+/** Total across all attachments in one message. Anything beyond is
+ *  dropped with a truncation marker. */
+export const ATTACHMENT_TOTAL_CAP = 8000
+
+function trimTo(s: string, cap: number): string {
+  if (s.length <= cap) return s
+  return `${s.slice(0, cap)}…[truncated ${s.length - cap} chars]`
+}
+
+/** Flatten Slack `attachments[]` (used for Forward, quoted replies, and
+ *  rich message previews) into a single tagged text block.
+ *
+ *  Returns null if the input has no usable content — callers should
+ *  leave the top-level `text` alone in that case.
+ *
+ *  Security: the fields extracted here (author_name, title, text,
+ *  block text) are all third-party-authored strings. They land in the
+ *  agent's context indistinguishable from a first-party owner message,
+ *  so:
+ *    - Every attachment is prefixed with `(from <author_name>)` when
+ *      Slack preserved the original author, giving the agent a
+ *      provenance signal for its own reasoning.
+ *    - Total content is capped per-attachment and per-message; a very
+ *      long paste-bomb inside a forward becomes `[truncated N chars]`
+ *      rather than an unbounded prompt-injection surface.
+ *  This does NOT sanitize the strings themselves — that's the
+ *  system-prompt hardening layer's job, same as any inbound Slack text.
+ */
+export function flattenSlackAttachments(
+  attachments: unknown,
+  opts: { perCap?: number; totalCap?: number } = {},
+): { text: string; count: number } | null {
+  if (!Array.isArray(attachments) || attachments.length === 0) return null
+  const perCap = opts.perCap ?? ATTACHMENT_PER_CAP
+  const totalCap = opts.totalCap ?? ATTACHMENT_TOTAL_CAP
+
+  const flattened: string[] = []
+  let usedChars = 0
+  let truncatedByTotal = 0
+
+  for (const att of attachments as Array<Record<string, unknown>>) {
+    if (usedChars >= totalCap) {
+      truncatedByTotal += 1
+      continue
+    }
+    const parts: string[] = []
+    const authorName = typeof att.author_name === 'string' ? att.author_name : ''
+    const title = typeof att.title === 'string' ? att.title : ''
+    const attText = typeof att.text === 'string' ? att.text : ''
+    if (authorName) parts.push(`(from ${authorName})`)
+    if (title) parts.push(title)
+    if (attText) {
+      parts.push(attText)
+    } else if (Array.isArray(att.blocks)) {
+      for (const block of att.blocks as Array<Record<string, unknown>>) {
+        const textField = block?.text as unknown
+        const inner =
+          typeof textField === 'string'
+            ? textField
+            : textField &&
+                typeof textField === 'object' &&
+                typeof (textField as { text?: unknown }).text === 'string'
+              ? (textField as { text: string }).text
+              : ''
+        if (inner.length) parts.push(inner)
+      }
+    }
+    if (parts.length === 0) continue
+
+    const joined = parts.join(' — ')
+    const remainingBudget = Math.max(0, totalCap - usedChars)
+    const cap = Math.min(perCap, remainingBudget)
+    const clipped = trimTo(joined, cap)
+    flattened.push(clipped)
+    usedChars += clipped.length
+  }
+
+  if (flattened.length === 0) return null
+  const suffix =
+    truncatedByTotal > 0
+      ? `\n---\n[${truncatedByTotal} more attachment(s) omitted: total cap ${totalCap}]`
+      : ''
+  return {
+    text: `[attached/forwarded]\n${flattened.join('\n---\n')}${suffix}`,
+    count: flattened.length,
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Event deduplication
 // ---------------------------------------------------------------------------
 

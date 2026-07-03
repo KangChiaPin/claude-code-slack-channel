@@ -44,6 +44,7 @@ import {
   escMrkdwn,
   extractSlackErrorCode,
   findSecretDeclaration,
+  flattenSlackAttachments,
   type GateOptions,
   gate,
   generateCode,
@@ -173,6 +174,26 @@ describe('gate', () => {
     const access = makeAccess({ allowFrom: ['U123'] })
     const result = await gate(
       { subtype: 'file_share', user: 'U123', channel_type: 'im', channel: 'D1' },
+      makeOpts({ access }),
+    )
+    expect(result.action).toBe('deliver')
+  })
+
+  test('allows a message with attachments (forward) — no subtype', async () => {
+    // Slack's built-in Forward feature ships a regular subtype-less
+    // message whose original body lives in attachments[]. The gate
+    // must not drop this — otherwise the forward flattening in
+    // server.ts is silently dead. Guards against a future Slack
+    // rev that introduces a `share`-style subtype for forwards.
+    const access = makeAccess({ allowFrom: ['U123'] })
+    const result = await gate(
+      {
+        user: 'U123',
+        channel_type: 'im',
+        channel: 'D1',
+        text: '',
+        attachments: [{ author_name: 'Alice', text: 'forwarded body' }],
+      },
       makeOpts({ access }),
     )
     expect(result.action).toBe('deliver')
@@ -1577,6 +1598,87 @@ describe('chunkText', () => {
     const text = 'short\nshort\nshort'
     const result = chunkText(text, 100, 'newline')
     expect(result).toEqual(['short\nshort\nshort'])
+  })
+})
+
+// ---------------------------------------------------------------------------
+// flattenSlackAttachments()
+// ---------------------------------------------------------------------------
+
+describe('flattenSlackAttachments', () => {
+  test('returns null for empty / non-array input', () => {
+    expect(flattenSlackAttachments(undefined)).toBeNull()
+    expect(flattenSlackAttachments(null)).toBeNull()
+    expect(flattenSlackAttachments([])).toBeNull()
+    expect(flattenSlackAttachments('not-an-array')).toBeNull()
+  })
+
+  test('flattens a Slack forward with author + text', () => {
+    const out = flattenSlackAttachments([
+      { author_name: 'Alice', text: 'the original body of the forwarded message' },
+    ])
+    expect(out).not.toBeNull()
+    expect(out!.count).toBe(1)
+    expect(out!.text).toContain('[attached/forwarded]')
+    expect(out!.text).toContain('(from Alice)')
+    expect(out!.text).toContain('the original body')
+  })
+
+  test('extracts text from blocks when attachment.text is empty', () => {
+    const out = flattenSlackAttachments([
+      {
+        author_name: 'Bob',
+        blocks: [{ type: 'section', text: { type: 'mrkdwn', text: 'block-based body' } }],
+      },
+    ])
+    expect(out!.text).toContain('block-based body')
+    expect(out!.count).toBe(1)
+  })
+
+  test('handles plain-string block.text (not object)', () => {
+    const out = flattenSlackAttachments([{ blocks: [{ text: 'stringy block' }] }])
+    expect(out!.text).toContain('stringy block')
+  })
+
+  test('skips attachments with no usable content', () => {
+    const out = flattenSlackAttachments([
+      { color: '#ff0000' },
+      { author_name: 'Carol', text: 'real content' },
+      {},
+    ])
+    expect(out!.count).toBe(1)
+    expect(out!.text).toContain('(from Carol)')
+  })
+
+  test('caps per-attachment length with truncation marker', () => {
+    const bomb = 'x'.repeat(5000)
+    const out = flattenSlackAttachments([{ text: bomb }], { perCap: 100, totalCap: 200 })
+    expect(out!.text).toContain('[truncated')
+    expect(out!.text.length).toBeLessThan(500)
+  })
+
+  test('caps total across many attachments + records omitted count', () => {
+    const many = Array.from({ length: 20 }, (_, i) => ({ text: `${'x'.repeat(200)}#${i}` }))
+    const out = flattenSlackAttachments(many, { perCap: 500, totalCap: 400 })
+    expect(out!.text).toMatch(/\[\d+ more attachment\(s\) omitted/)
+    expect(out!.count).toBeLessThan(20)
+  })
+
+  test('joins multiple attachments with a divider', () => {
+    const out = flattenSlackAttachments([{ text: 'first' }, { text: 'second' }])
+    expect(out!.count).toBe(2)
+    expect(out!.text).toContain('first')
+    expect(out!.text).toContain('second')
+    expect(out!.text).toContain('---')
+  })
+
+  test('safely ignores non-string author_name / title / text fields', () => {
+    const out = flattenSlackAttachments([
+      { author_name: 123, title: null, text: undefined },
+      { text: 'good content' },
+    ])
+    expect(out!.count).toBe(1)
+    expect(out!.text).toContain('good content')
   })
 })
 
