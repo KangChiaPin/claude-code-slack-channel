@@ -3677,6 +3677,36 @@ async function deliverEvent(ev: Record<string, unknown>, access: Access): Promis
     text = text.replace(new RegExp(`<@${botUserId}>\\s*`, 'g'), '').trim()
   }
 
+  // Flatten Slack `attachments` (used for forwards, quoted replies, and
+  // rich message previews) into text. Slack's built-in Forward feature
+  // puts the original body in ev.attachments[*].text/blocks, leaving
+  // ev.text empty or with only a "forwarded from" hint — without this
+  // the downstream Claude session sees nothing meaningful and the user
+  // gets "什麼？" from a bot that was clearly pinged. Distinct from
+  // ev.files (handled above) which is Slack's file-upload payload.
+  const evAttachments = ev.attachments as any[] | undefined
+  if (evAttachments?.length) {
+    const flattened: string[] = []
+    for (const att of evAttachments) {
+      const parts: string[] = []
+      if (att.author_name) parts.push(`(from ${att.author_name})`)
+      if (att.title) parts.push(att.title)
+      if (att.text) parts.push(att.text)
+      if (!att.text && Array.isArray(att.blocks)) {
+        for (const block of att.blocks) {
+          const blockText = block?.text?.text ?? block?.text
+          if (typeof blockText === 'string' && blockText.length) parts.push(blockText)
+        }
+      }
+      if (parts.length) flattened.push(parts.join(' — '))
+    }
+    if (flattened.length) {
+      const forwardBlock = `[attached/forwarded]\n${flattened.join('\n---\n')}`
+      text = text ? `${text}\n\n${forwardBlock}` : forwardBlock
+      meta.forward_count = String(evAttachments.length)
+    }
+  }
+
   // Optional role-hook integration (no-op unless OWNER_SLACK_USER_ID +
   // SLACK_ROLE_HOOK_FILE are both set; see boot-time constants above).
   // user_id is the trustworthy Slack-set identifier — see comment on the
