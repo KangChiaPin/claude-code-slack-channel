@@ -1650,11 +1650,15 @@ describe('flattenSlackAttachments', () => {
     expect(out!.text).toContain('(from Carol)')
   })
 
-  test('caps per-attachment length with truncation marker', () => {
+  test('caps per-attachment length with truncation marker AND respects cap', () => {
     const bomb = 'x'.repeat(5000)
     const out = flattenSlackAttachments([{ text: bomb }], { perCap: 100, totalCap: 200 })
     expect(out!.text).toContain('[truncated')
-    expect(out!.text.length).toBeLessThan(500)
+    // Previous version leaked ~25 chars beyond cap by appending the
+    // marker on top of the sliced content. Verify the clipped
+    // attachment now stays within perCap.
+    const attachmentBody = out!.text.replace(/^\[attached\/forwarded\]\n/, '')
+    expect(attachmentBody.length).toBeLessThanOrEqual(100)
   })
 
   test('caps total across many attachments + records omitted count', () => {
@@ -1662,6 +1666,26 @@ describe('flattenSlackAttachments', () => {
     const out = flattenSlackAttachments(many, { perCap: 500, totalCap: 400 })
     expect(out!.text).toMatch(/\[\d+ more attachment\(s\) omitted/)
     expect(out!.count).toBeLessThan(20)
+  })
+
+  test('empty-content attachments do not inflate omitted count', () => {
+    // Slack decorates messages with colour-only "attachments" that
+    // carry no text/blocks. Those shouldn't count toward the
+    // "N more attachment(s) omitted" budget — reporting decorations
+    // as if they contained hidden content would be noise.
+    const out = flattenSlackAttachments(
+      [
+        { text: 'first' }, // fits in budget
+        { color: '#00ff00' }, // decoration — no text — skipped silently
+        { text: `${'x'.repeat(500)}` }, // fills the remaining budget
+        { color: '#ff0000' }, // decoration AFTER cap — must not omit-count
+        { text: 'has real text but no budget' }, // must omit-count
+      ],
+      { perCap: 500, totalCap: 100 },
+    )
+    // Only the 5th (real text, no budget) counts as omitted.
+    // The two colour-only ones stay silent as before this fix.
+    expect(out!.text).toContain('1 more attachment(s) omitted')
   })
 
   test('joins multiple attachments with a divider', () => {

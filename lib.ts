@@ -1897,7 +1897,16 @@ export const ATTACHMENT_TOTAL_CAP = 8000
 
 function trimTo(s: string, cap: number): string {
   if (s.length <= cap) return s
-  return `${s.slice(0, cap)}…[truncated ${s.length - cap} chars]`
+  // Reserve marker budget so the returned string never exceeds cap.
+  // The previous version appended "…[truncated N chars]" beyond cap,
+  // overshooting totalCap by ~25 chars per truncated attachment.
+  const marker = `…[truncated ${s.length - cap} chars]`
+  if (cap <= marker.length) {
+    // Cap too tight to fit the marker itself — drop the content and
+    // just emit the marker (still bounded).
+    return marker.slice(0, cap)
+  }
+  return `${s.slice(0, cap - marker.length)}${marker}`
 }
 
 /** Flatten Slack `attachments[]` (used for Forward, quoted replies, and
@@ -1932,10 +1941,6 @@ export function flattenSlackAttachments(
   let truncatedByTotal = 0
 
   for (const att of attachments as Array<Record<string, unknown>>) {
-    if (usedChars >= totalCap) {
-      truncatedByTotal += 1
-      continue
-    }
     const parts: string[] = []
     const authorName = typeof att.author_name === 'string' ? att.author_name : ''
     const title = typeof att.title === 'string' ? att.title : ''
@@ -1958,7 +1963,19 @@ export function flattenSlackAttachments(
         if (inner.length) parts.push(inner)
       }
     }
+    // Empty-content attachments (colour-only rich cards, decorations)
+    // don't consume the omitted-count budget — reporting "N more
+    // omitted" for cards that had no text to show would just be noise.
     if (parts.length === 0) continue
+
+    // Only NOW check the total budget. Previously we incremented
+    // truncatedByTotal for attachments that would have produced no
+    // text, inflating the "N more omitted" count for cards Slack
+    // sent as pure decoration.
+    if (usedChars >= totalCap) {
+      truncatedByTotal += 1
+      continue
+    }
 
     const joined = parts.join(' — ')
     const remainingBudget = Math.max(0, totalCap - usedChars)
