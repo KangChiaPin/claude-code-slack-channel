@@ -1928,6 +1928,29 @@ function trimTo(s: string, cap: number): string {
  *  This does NOT sanitize the strings themselves — that's the
  *  system-prompt hardening layer's job, same as any inbound Slack text.
  */
+/** Convenience wrapper that flattens `attachments`, merges the result
+ *  into an existing text string, and writes `forward_count` into a
+ *  caller-provided meta bag. Returns the (possibly-appended) text.
+ *
+ *  Exists so callers can do:
+ *    text = mergeAttachmentTextIntoInbound(text, ev.attachments, meta)
+ *  instead of a two-branch if/else that pushes deliverEvent's
+ *  cyclomatic complexity over the crap-score gate.
+ *
+ *  Kept as a thin wrapper (no new logic) — all cap/security behaviour
+ *  lives in flattenSlackAttachments and is covered by its unit tests.
+ */
+export function mergeAttachmentTextIntoInbound(
+  text: string,
+  attachments: unknown,
+  meta: Record<string, string>,
+): string {
+  const flat = flattenSlackAttachments(attachments)
+  if (!flat) return text
+  meta.forward_count = String(flat.count)
+  return text ? `${text}\n\n${flat.text}` : flat.text
+}
+
 export function flattenSlackAttachments(
   attachments: unknown,
   opts: { perCap?: number; totalCap?: number } = {},

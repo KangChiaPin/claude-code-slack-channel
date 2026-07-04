@@ -43,7 +43,6 @@ import {
   EVENT_DEDUP_TTL_MS,
   enforceAuditReceiptCap,
   escMrkdwn,
-  flattenSlackAttachments,
   formatVerifyResult,
   type GateResult,
   isDuplicateEvent,
@@ -56,6 +55,7 @@ import {
   gate as libGate,
   listSessions as libListSessions,
   makeIdempotentSend,
+  mergeAttachmentTextIntoInbound,
   PERMISSION_REPLY_RE,
   type PendingPolicyApproval,
   parseSendableRoots,
@@ -3684,11 +3684,10 @@ async function deliverEvent(ev: Record<string, unknown>, access: Access): Promis
   // ev.text empty or with only a "forwarded from" hint — without this
   // the downstream Claude session sees nothing meaningful. Distinct
   // from ev.files (handled above) which is Slack's file-upload payload.
-  const flatten = flattenSlackAttachments(ev.attachments)
-  if (flatten) {
-    text = text ? `${text}\n\n${flatten.text}` : flatten.text
-    meta.forward_count = String(flatten.count)
-  }
+  // Wrapper keeps deliverEvent's cyclomatic complexity below the
+  // crap-score gate; the actual flatten + cap logic (and its unit
+  // tests) live in flattenSlackAttachments.
+  text = mergeAttachmentTextIntoInbound(text, ev.attachments, meta)
 
   // Optional role-hook integration (no-op unless OWNER_SLACK_USER_ID +
   // SLACK_ROLE_HOOK_FILE are both set; see boot-time constants above).

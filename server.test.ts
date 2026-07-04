@@ -58,6 +58,7 @@ import {
   MAX_PENDING,
   MIGRATED_DEFAULT_THREAD,
   makeIdempotentSend,
+  mergeAttachmentTextIntoInbound,
   migrateFlatSessions,
   NON_RETRYABLE_SLACK_ERRORS,
   PAIRING_EXPIRY_MS,
@@ -1703,6 +1704,34 @@ describe('flattenSlackAttachments', () => {
     ])
     expect(out!.count).toBe(1)
     expect(out!.text).toContain('good content')
+  })
+})
+
+describe('mergeAttachmentTextIntoInbound', () => {
+  test('returns text unchanged and does not touch meta when no attachments', () => {
+    const meta: Record<string, string> = { chat_id: 'C1' }
+    const out = mergeAttachmentTextIntoInbound('hello', undefined, meta)
+    expect(out).toBe('hello')
+    expect(meta.forward_count).toBeUndefined()
+  })
+
+  test('appends flattened block and writes forward_count when attachments present', () => {
+    const meta: Record<string, string> = {}
+    const out = mergeAttachmentTextIntoInbound(
+      'top-level',
+      [{ author_name: 'Alice', text: 'forwarded body' }],
+      meta,
+    )
+    expect(out).toContain('top-level')
+    expect(out).toContain('[attached/forwarded]')
+    expect(out).toContain('(from Alice)')
+    expect(meta.forward_count).toBe('1')
+  })
+
+  test('when top text is empty, returns just the flattened block (no leading blank line)', () => {
+    const meta: Record<string, string> = {}
+    const out = mergeAttachmentTextIntoInbound('', [{ text: 'body' }], meta)
+    expect(out.startsWith('[attached/forwarded]')).toBe(true)
   })
 })
 
