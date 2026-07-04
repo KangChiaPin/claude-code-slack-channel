@@ -2001,11 +2001,17 @@ export function flattenSlackAttachments(
     }
 
     const joined = parts.join(' — ')
-    const remainingBudget = Math.max(0, totalCap - usedChars)
+    // Count the "\n---\n" joiner that will separate this entry from
+    // the previous one (5 chars). Without this the totalCap can be
+    // overshot by 5 chars per accepted attachment — bounded in
+    // practice (Slack caps ~20 attachments per message → ~95 char
+    // overshoot) but the accounting should just be honest.
+    const joinerCost = flattened.length > 0 ? 5 : 0
+    const remainingBudget = Math.max(0, totalCap - usedChars - joinerCost)
     const cap = Math.min(perCap, remainingBudget)
     const clipped = trimTo(joined, cap)
     flattened.push(clipped)
-    usedChars += clipped.length
+    usedChars += clipped.length + joinerCost
   }
 
   if (flattened.length === 0) return null
