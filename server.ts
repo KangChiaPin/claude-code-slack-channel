@@ -214,25 +214,14 @@ const DENIED_DM_COOLDOWN_DEFAULT_SEC = 3600
 
 /** Atomically write the resolved role to SLACK_ROLE_HOOK_FILE.
  *
- *  File format: `role:thread_ts:unix_ts\n`
- *    - role:      "owner" | "contributor"
- *    - thread_ts: Slack thread timestamp for the current inbound (empty for
- *                 top-level messages); lets hooks distinguish which thread
- *                 drove this role assignment.
- *    - unix_ts:   seconds since epoch at write time; the PreToolUse hook uses
- *                 this to expire stale entries (> 10 min old → owner default),
- *                 which eliminates the need for a PostToolUse reset hook.
- *
  *  Write to a sibling tmp file then rename so a concurrent reader (the
  *  PreToolUse hook) never observes a half-written file. Best-effort: errors
  *  are logged and swallowed — failing to write the hook file MUST NOT block
  *  inbound message delivery to Claude. */
-function writeRoleHookFileAtomic(filePath: string, role: SenderRole, threadTs?: string): void {
+function writeRoleHookFileAtomic(filePath: string, role: SenderRole): void {
   const tmp = `${filePath}.${process.pid}.tmp`
-  const unixTs = Math.floor(Date.now() / 1000)
-  const content = `${role}:${threadTs ?? ''}:${unixTs}\n`
   try {
-    writeFileSync(tmp, content, { mode: 0o600 })
+    writeFileSync(tmp, `${role}\n`, { mode: 0o600 })
     renameSync(tmp, filePath)
   } catch (err) {
     console.error(
@@ -2484,7 +2473,7 @@ async function handleChoiceClick(
   if (ROLE_HOOK_ENABLED) {
     const role = deriveRoleForSender(userIdSafe, OWNER_USER_ID)
     meta.role = role
-    writeRoleHookFileAtomic(ROLE_HOOK_FILE, role, threadTs ?? messageTs)
+    writeRoleHookFileAtomic(ROLE_HOOK_FILE, role)
   }
 
   journalWrite({
@@ -4001,7 +3990,7 @@ async function deliverEvent(ev: Record<string, unknown>, access: Access): Promis
   if (ROLE_HOOK_ENABLED) {
     const role = deriveRoleForSender(userIdSafe, OWNER_USER_ID)
     meta.role = role
-    writeRoleHookFileAtomic(ROLE_HOOK_FILE, role, meta.thread_ts ?? meta.ts)
+    writeRoleHookFileAtomic(ROLE_HOOK_FILE, role)
   }
 
   // Push into Claude Code session via MCP notification
