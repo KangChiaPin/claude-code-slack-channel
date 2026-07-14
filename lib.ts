@@ -166,6 +166,28 @@ export interface Access {
   policy?: readonly unknown[]
 }
 
+/** Fail-closed channel-policy lookup (ccsc-x0t.8). The single accessor for
+ *  `access.channels[id]` — every gate and read routes through here.
+ *
+ *  A bare `access.channels[id]` index reads inherited `Object.prototype`
+ *  members off the prototype chain for ids like `'constructor'` / `'toString'`
+ *  / `'__proto__'`, so a channel id equal to a prototype key could read a
+ *  truthy value (a function) and slip past a truthiness-based gate. Not
+ *  exploitable today (Slack channel ids are `[CD][A-Z0-9]+`, never those
+ *  forms), but routing all lookups through one `Object.hasOwn` accessor
+ *  removes the footgun class and the six scattered ad-hoc guards. Returns
+ *  `undefined` for a missing id OR a non-own (prototype) key.
+ *
+ *  `access.channels` is typed as always-present, but a loaded-from-disk Access
+ *  can lack it (the pre-x0t.8 admin-command site used `channels?.[id]`), and
+ *  `Object.hasOwn(undefined, …)` throws — so the missing-channels case is
+ *  guarded and fails closed (returns `undefined`), never a `TypeError`
+ *  (Gemini review, PR #275). */
+export function getChannelPolicy(access: Access, channelId: string): ChannelPolicy | undefined {
+  const channels = access.channels
+  return channels && Object.hasOwn(channels, channelId) ? channels[channelId] : undefined
+}
+
 export type GateAction = 'deliver' | 'drop' | 'pair'
 
 /** Structured reason for a drop. As of ccsc-apj.2 EVERY inbound gate
@@ -435,6 +457,92 @@ export function computeBackoffMs(attempt: number, opts: BackoffOptions = {}): nu
   const factor = opts.factor ?? 2
   const maxMs = opts.maxMs ?? 30_000
   return Math.min(baseMs * factor ** (attempt - 1), maxMs)
+}
+
+// ---------------------------------------------------------------------------
+// Socket Mode start() classification + backoff (ccsc-x0t.4 / ccsc-x0t.10)
+//
+// The @slack/socket-mode client auto-reconnects ONCE started; the retry loop
+// in server.ts only guards the initial start(). Slack throws a small set of
+// auth/config errors out of retrieveWSSURL as permanently fatal (retrying them
+// forever masks a dead channel). Everything else — persistent 5xx, proxy
+// blackhole, DNS/TLS failure (thrown as RequestError/HTTPError) — is transient:
+// bounded-retry then fail loud. #268 implemented this loop inline; extracting
+// the classification + backoff here makes the DECISION logic unit-testable
+// without importing server.ts (which runs main() on import).
+// ---------------------------------------------------------------------------
+
+/** Socket Mode start() errors Slack throws out of `retrieveWSSURL` as
+ *  permanently fatal (auth/config), rather than reconnecting internally. The
+ *  message-regex fallback catches wrapped/stringified errors that carry no
+ *  structured `data.error` code. */
+export const UNRECOVERABLE_SOCKET_START_RE =
+  /not_authed|invalid_auth|account_inactive|user_removed_from_team|team_disabled|token_revoked|token_expired/
+
+/** Classify a Socket Mode `start()` failure. `'fatal'` → shut down loud and
+ *  non-zero (retrying a revoked/wrong token masks a permanently-dead channel);
+ *  `'retryable'` → transient, back off and retry up to a bounded cap. Prefers
+ *  the structured Slack code (`NON_RETRYABLE_SLACK_ERRORS` via
+ *  `extractSlackErrorCode`) and falls back to the message regex. Pure so the
+ *  boot-path decision is testable without importing server.ts (ccsc-x0t.10). */
+export function classifySocketStartError(err: unknown): 'fatal' | 'retryable' {
+  const code = extractSlackErrorCode(err)
+  if (code !== undefined && NON_RETRYABLE_SLACK_ERRORS.has(code)) return 'fatal'
+  if (UNRECOVERABLE_SOCKET_START_RE.test(errorMessage(err))) return 'fatal'
+  return 'retryable'
+}
+
+/** Best-effort message extraction from an unknown throw. Handles Error
+ *  instances AND plain error-like objects carrying a string `message` (Gemini
+ *  review, PR #274): a serialized/wrapped Slack error thrown as a plain object
+ *  would otherwise `String()` to "[object Object]" and slip past the regex,
+ *  misclassifying a fatal auth error as retryable. */
+function errorMessage(err: unknown): string {
+  if (err instanceof Error) return err.message
+  if (typeof err === 'object' && err !== null && 'message' in err) {
+    const m = (err as Record<string, unknown>).message
+    if (typeof m === 'string') return m
+  }
+  return String(err)
+}
+
+/** Cap on a single Socket Mode start() retry backoff. */
+export const SOCKET_START_BACKOFF_CAP_MS = 60_000
+
+/** Next exponential backoff for the socket-start retry loop, doubling and
+ *  clamped to `SOCKET_START_BACKOFF_CAP_MS`. Pure (ccsc-x0t.10). */
+export function nextSocketStartBackoffMs(prevMs: number): number {
+  return Math.min(prevMs * 2, SOCKET_START_BACKOFF_CAP_MS)
+}
+
+// ---------------------------------------------------------------------------
+// publish_manifest identity guard (ccsc-x0t.3)
+//
+// server.ts connects the MCP transport before web.auth.test() resolves, so
+// there is a window (sub-second happy path; up to ~30 min while Slack auth
+// degrades and the WebClient retries) where tools are live but botUserId is
+// still ''. findOurPriorManifestPins fails closed on '', so the manifest
+// replace-sweep would silently no-op and leave DUPLICATE pinned manifests.
+// #268 added a bounded-await on an identity latch, then fails the call loudly
+// (retryable) if identity is still unresolved. This guard is the pure decision
+// at the end of that await — extracted so it's testable without importing
+// server.ts.
+// ---------------------------------------------------------------------------
+
+/** Message thrown when publish_manifest is attempted before Slack auth resolves
+ *  bot identity. Exported so the test asserts against one string, not a copy. */
+export const MANIFEST_IDENTITY_UNRESOLVED_MSG =
+  'publish_manifest: bot identity not yet resolved (Slack auth still connecting); retry shortly'
+
+/** Fail publish_manifest loudly (retryable) when bot identity is still
+ *  unresolved after the identity-latch await. Publishing with an unresolved
+ *  botUserId would make the replace-sweep silently no-op (findOurPriorManifestPins
+ *  fails closed on ''), leaving duplicate pinned manifests. Accepts nullable and
+ *  rejects any falsy or whitespace-only identity — a security guard fails closed
+ *  on every invalid identity, not just the exact empty string (Gemini review,
+ *  PR #274). Pure (ccsc-x0t.3). */
+export function assertManifestIdentityResolved(botUserId: string | null | undefined): void {
+  if (!botUserId || botUserId.trim() === '') throw new Error(MANIFEST_IDENTITY_UNRESOLVED_MSG)
 }
 
 /** Slack message-metadata `event_type` marking a message as a CCSC reply
@@ -1616,7 +1724,7 @@ export function assertOutboundAllowed(
   access: Access,
   deliveredThreads: ReadonlySet<string>,
 ): void {
-  if (access.channels[chatId]) return
+  if (getChannelPolicy(access, chatId)) return
   if (deliveredThreads.has(deliveredThreadKey(chatId, threadTs))) return
   throw new Error(
     `Outbound gate: (channel ${chatId}, thread ${threadTs ?? '<top-level>'}) is not in the allowlist or delivered-threads set.`,
@@ -1811,7 +1919,7 @@ function handleBotEvent(ev: Record<string, unknown>, opts: GateOptions): GateRes
   // Per-channel opt-in: only deliver if the channel explicitly lists this
   // bot's user ID in allowBotIds. No allowBotIds = all bots dropped.
   const channel = ev.channel as string
-  const policy = opts.access.channels[channel]
+  const policy = getChannelPolicy(opts.access, channel)
   const botUser = ev.user as string | undefined
   if (!policy?.allowBotIds?.length || !botUser || !policy.allowBotIds.includes(botUser)) {
     return { action: 'drop', dropReason: 'bot.not_allowlisted' }
@@ -1940,7 +2048,7 @@ async function handleDmEvent(ev: Record<string, unknown>, opts: GateOptions): Pr
 function handleChannelEvent(ev: Record<string, unknown>, opts: GateOptions): GateResult {
   const { access, botUserId } = opts
   const channel = ev.channel as string
-  const policy = access.channels[channel]
+  const policy = getChannelPolicy(access, channel)
   if (!policy) return { action: 'drop', dropReason: 'channel.not_opted' }
 
   if (policy.allowFrom.length > 0 && !policy.allowFrom.includes(ev.user as string)) {
@@ -2346,6 +2454,11 @@ export type PolicyDecisionShape =
       approver: 'human_approver'
       ttlMs: number
       approvers: number
+      /** Mirror of `PolicyDecision`'s require-variant `reason` (policy.ts):
+       *  set only on the input-unavailable fail-safe path (ccsc-x0t.5).
+       *  Kept in lock-step by the bidirectional `satisfies` guard in
+       *  policy.ts — drift breaks the build. */
+      reason?: string
     }
 
 /** What the server handler should do with a policy decision. Four
@@ -2719,6 +2832,114 @@ export function parseVerifyArg(argv: ReadonlyArray<string>): string | null {
   return null
 }
 
+/** Parse `--min-events N` (ccsc-x0t.9). Returns the non-negative integer floor
+ *  when the flag is present with a valid value, or null when the flag is
+ *  ABSENT. **Throws** when the flag is present but its value is missing or
+ *  malformed — this is deliberately fail-closed (Gemini review, PR #277):
+ *  silently returning null on a typo like `--min-events 1OO` (letter O) would
+ *  disable the very tamper-check the flag exists for, so a wiped log could pass.
+ *  A present-but-broken flag must be loud, never a silent no-op.
+ *
+ *  Why this exists: `verifyJournal` of a wiped-to-empty `audit.log` returns
+ *  `{ ok: true, eventsVerified: 0 }`, which `formatVerifyResult` prints as
+ *  `OK: 0 event(s) verified` with exit 0 — so a MONITORING SCRIPT reads a
+ *  destroyed log as "verified clean". An operator who knows the log should
+ *  contain at least N events passes `--min-events N`; if it's been wiped below
+ *  that, `formatVerifyResult` fails the check (exit 1). A first-boot empty log
+ *  is still legitimately valid, so the floor is operator-supplied — the flag is
+ *  optional, but if supplied it must be valid.
+ *
+ *  Forms: `--min-events N` (space) / `--min-events=N` (equals). Rejects
+ *  negatives, non-integers, and empty values by throwing. */
+/** Shared fail-closed parser for a `--flag N` non-negative-integer CLI option
+ *  (ccsc-x0t.9 / ccsc-x0t.7). Returns the integer when the flag is present with
+ *  a valid value, null when the flag is ABSENT, and THROWS when the flag is
+ *  present but its value is missing or malformed — a present-but-broken
+ *  security flag must be loud, never a silent no-op that disables the check it
+ *  configures. Accepts `--flag N` (space) and `--flag=N` (equals). */
+function parseNonNegIntFlag(argv: ReadonlyArray<string>, flag: string): number | null {
+  const accept = (raw: string): number => {
+    if (!/^\d+$/.test(raw)) {
+      throw new Error(
+        `invalid ${flag} value ${JSON.stringify(raw)}: must be a non-negative integer`,
+      )
+    }
+    const n = Number.parseInt(raw, 10)
+    if (!Number.isSafeInteger(n)) {
+      throw new Error(`invalid ${flag} value ${JSON.stringify(raw)}: exceeds safe integer range`)
+    }
+    return n
+  }
+  const eq = `${flag}=`
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i]!
+    if (arg === flag) {
+      const next = argv[i + 1]
+      // A following token that is itself a flag (or no token) is a missing
+      // value — fail closed rather than swallow the next flag as the count.
+      // A `-`-prefixed token is treated as the NEXT flag (missing value) — but a
+      // negative number (`-5`) is routed to `accept()` so it throws the accurate
+      // "invalid value" error instead of a misleading "missing value" (Gemini
+      // review, PR #278). Both still fail closed; only the message differs.
+      if (typeof next === 'string' && (!next.startsWith('-') || /^-\d/.test(next))) {
+        return accept(next)
+      }
+      throw new Error(`missing value for ${flag} (expected a non-negative integer)`)
+    }
+    if (arg.startsWith(eq)) {
+      return accept(arg.slice(eq.length))
+    }
+  }
+  return null
+}
+
+export function parseMinEventsArg(argv: ReadonlyArray<string>): number | null {
+  return parseNonNegIntFlag(argv, '--min-events')
+}
+
+/** Parse `--v2-floor-seq N` (ccsc-x0t.7). The `seq` at/after which every event
+ *  must be v2 (signed) — passed to `verifyJournal` as `v2FloorSeq` to defeat a
+ *  uniform downgrade-to-v1. Same fail-closed discipline as `--min-events`. */
+export function parseV2FloorSeqArg(argv: ReadonlyArray<string>): number | null {
+  return parseNonNegIntFlag(argv, '--v2-floor-seq')
+}
+
+/** Parse `--expected-genesis-hash HEX` (ccsc-x0t.7). The pinned genesis anchor
+ *  (the writer's `initialPrevHash`, captured out-of-band) passed to
+ *  `verifyJournal` as `pinnedGenesisHash`. Must be a 64-char lowercase-hex
+ *  SHA-256. Returns null when absent; THROWS when present but malformed (a
+ *  typo'd anchor would otherwise silently disable head-truncation detection). */
+export function parseExpectedGenesisArg(argv: ReadonlyArray<string>): string | null {
+  const accept = (raw: string): string => {
+    if (!/^[0-9a-f]{64}$/.test(raw)) {
+      throw new Error(
+        `invalid --expected-genesis-hash ${JSON.stringify(raw)}: must be 64 lowercase hex chars (a SHA-256)`,
+      )
+    }
+    return raw
+  }
+  const flag = '--expected-genesis-hash'
+  const eq = `${flag}=`
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i]!
+    if (arg === flag) {
+      const next = argv[i + 1]
+      // A `-`-prefixed token is treated as the NEXT flag (missing value) — but a
+      // negative number (`-5`) is routed to `accept()` so it throws the accurate
+      // "invalid value" error instead of a misleading "missing value" (Gemini
+      // review, PR #278). Both still fail closed; only the message differs.
+      if (typeof next === 'string' && (!next.startsWith('-') || /^-\d/.test(next))) {
+        return accept(next)
+      }
+      throw new Error(`missing value for ${flag} (expected a 64-char hex SHA-256)`)
+    }
+    if (arg.startsWith(eq)) {
+      return accept(arg.slice(eq.length))
+    }
+  }
+  return null
+}
+
 /** Shape mirror of `VerifyResult` from journal.ts, repeated here so
  *  lib.ts stays framework-free (no journal.ts import — avoids a cycle
  *  and keeps lib.ts pure). Discriminated on `ok`. */
@@ -2751,8 +2972,22 @@ export type VerifyResultShape =
 export function formatVerifyResult(
   result: VerifyResultShape,
   path: string,
+  minEvents?: number,
 ): { text: string; exitCode: 0 | 1 } {
   if (result.ok) {
+    // eventsVerified floor (ccsc-x0t.9): a hash-clean chain that verifies fewer
+    // events than the operator expects is treated as a FAILURE — this is how a
+    // wiped/truncated-to-empty log stops reading as "verified clean" to a
+    // monitoring script. Absent floor → unchanged behavior.
+    if (minEvents !== undefined && result.eventsVerified < minEvents) {
+      return {
+        text:
+          `FAIL: audit journal too short at ${path}\n` +
+          `  reason:   verified ${result.eventsVerified} event(s), expected at least ${minEvents} ` +
+          `(--min-events) — the log may have been truncated or wiped`,
+        exitCode: 1,
+      }
+    }
     return {
       text: `OK: ${result.eventsVerified} event(s) verified in ${path}`,
       exitCode: 0,

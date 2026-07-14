@@ -31,11 +31,13 @@ import { createBootAnchor, JournalWriter, verifyJournal } from './journal.ts'
 import {
   type Access,
   AUDIT_RECEIPTS_MAX,
+  assertManifestIdentityResolved,
   assertPublishAllowed,
   buildAndPostAuditReceipt,
   buildSecretPlaceholderMap,
   buildSecretValueSet,
   chunkText,
+  classifySocketStartError,
   type DeliveryObligation,
   decidePermissionRoute,
   defaultAccess,
@@ -44,8 +46,10 @@ import {
   EVENT_DEDUP_TTL_MS,
   enforceAuditReceiptCap,
   escMrkdwn,
+  extractSlackErrorCode,
   formatVerifyResult,
   type GateResult,
+  getChannelPolicy,
   isDuplicateEvent,
   isSlackFileUrl,
   LIST_SESSIONS_MAX,
@@ -57,9 +61,13 @@ import {
   listSessions as libListSessions,
   makeIdempotentSend,
   mergeAttachmentTextIntoInbound,
+  nextSocketStartBackoffMs,
   PERMISSION_REPLY_RE,
   type PendingPolicyApproval,
+  parseExpectedGenesisArg,
+  parseMinEventsArg,
   parseSendableRoots,
+  parseV2FloorSeqArg,
   parseVerifyArg,
   permissionPairingKey as permKey,
   pruneExpired,
@@ -94,6 +102,7 @@ import {
   assertUniqueRuleIds,
   detectBroadAutoApprove,
   detectShadowing,
+  detectUnenforceablePredicates,
   type PolicyRule,
   type ToolCall as PolicyToolCall,
   parsePolicyRules,
@@ -134,8 +143,25 @@ const _verifyPath = parseVerifyArg(process.argv.slice(2))
 if (_verifyPath !== null) {
   const absPath = resolve(_verifyPath)
   try {
-    const result = await verifyJournal(absPath)
-    const { text, exitCode } = formatVerifyResult(result, absPath)
+    // Optional eventsVerified floor (ccsc-x0t.9): `--min-events N` makes a
+    // hash-clean-but-too-short log (e.g. wiped to empty) fail instead of
+    // reading as "verified clean" to a monitoring script. Parsed inside the
+    // try so a present-but-malformed flag (which throws — fail-closed, PR #277)
+    // exits non-zero with a clear message rather than silently disabling the
+    // floor or crashing at module load.
+    const _minEvents = parseMinEventsArg(process.argv.slice(2))
+    // Optional tamper anchors (ccsc-x0t.7): `--expected-genesis-hash HEX` pins
+    // the genesis prevHash (defeats head-shear+rechain) and `--v2-floor-seq N`
+    // requires every event at/after N to be signed v2 (defeats uniform
+    // downgrade-to-v1). Both parse fail-closed (throw on malformed → caught
+    // below). Absent → prior verify behavior.
+    const _genesis = parseExpectedGenesisArg(process.argv.slice(2))
+    const _v2Floor = parseV2FloorSeqArg(process.argv.slice(2))
+    const result = await verifyJournal(absPath, {
+      pinnedGenesisHash: _genesis ?? undefined,
+      v2FloorSeq: _v2Floor ?? undefined,
+    })
+    const { text, exitCode } = formatVerifyResult(result, absPath, _minEvents ?? undefined)
     if (exitCode === 0) {
       console.log(text)
     } else {
@@ -322,6 +348,14 @@ const socket = new SocketModeClient({ appToken })
 const userClient: WebClient | null = userToken ? new WebClient(userToken) : null
 
 let botUserId = ''
+// Settles once the boot-time web.auth.test() attempt completes (success OR
+// failure) — MCP connects before identity resolves, so tools that consume
+// identity (publish_manifest's replace-sweep) bounded-await this latch instead
+// of silently operating with '' identity during the window.
+let settleIdentity: () => void = () => {}
+const identitySettled = new Promise<void>((r) => {
+  settleIdentity = r
+})
 let selfBotId = ''
 let selfAppId = ''
 
@@ -483,7 +517,7 @@ async function postAuditReceiptIfEnabled(
     channel,
     thread,
     tool,
-    accessSnapshot.channels[channel],
+    getChannelPolicy(accessSnapshot, channel),
     (ctx) => console.error('[slack] audit receipt post failed (non-blocking):', ctx),
   )
   if (!result) return undefined
@@ -601,9 +635,20 @@ function loadPolicyRulesAtBoot(): readonly PolicyRule[] {
   for (const warning of broads) {
     console.error(`[slack] policy footgun warning: ${warning.message}`)
   }
+  // detectUnenforceablePredicates (ccsc-x0t.5) — the MCP permission_request
+  // gate carries no structured args, so pathPrefix/argEquals predicates can't
+  // be evaluated there; the evaluator fail-safes such deny/require rules to a
+  // human and skips such auto_approve rules. Warn loud at boot so the operator
+  // knows the rule behaves more coarsely at the gate than its JSON reads.
+  // Warn-not-block for the same reasons as the other two linters.
+  const unenforceable = detectUnenforceablePredicates(parsed)
+  for (const warning of unenforceable) {
+    console.error(`[slack] policy unenforceable-predicate warning: ${warning.message}`)
+  }
   console.error(
     `[slack] policy: loaded ${parsed.length} rule(s), ` +
-      `${shadows.length} shadow warning(s), ${broads.length} footgun warning(s)`,
+      `${shadows.length} shadow warning(s), ${broads.length} footgun warning(s), ` +
+      `${unenforceable.length} unenforceable-predicate warning(s)`,
   )
   return parsed
 }
@@ -674,7 +719,7 @@ function inboundSessionKey(
   // invalid empty-userId key (Gemini, PR #248).
   const senderId = (ev.user ?? ev.bot_id) as unknown
   if (
-    access.channels[channelId]?.perUserSessions === true &&
+    getChannelPolicy(access, channelId)?.perUserSessions === true &&
     typeof senderId === 'string' &&
     senderId !== ''
   ) {
@@ -2752,6 +2797,22 @@ async function executePublishManifest(
   // Gate 2: channel must be opted in, same as any outbound write.
   executePublishManifestGate2(channel, callerUserId, ctx)
 
+  // Identity guard: MCP connects before web.auth.test() resolves, so there is
+  // a window (sub-second happy path; up to ~30 min while Slack auth degrades
+  // and the WebClient retries) where tools are live but botUserId is still ''.
+  // findOurPriorManifestPins fails closed on '' and the replace-sweep would
+  // silently no-op, leaving duplicate pinned manifests. Bounded-await the
+  // identity latch; if identity is still unresolved, fail the call loudly as
+  // retryable rather than publish with a silent sweep skip.
+  if (ctx.botUserId === '') {
+    await Promise.race([identitySettled, new Promise((r) => setTimeout(r, 5_000))])
+    // Refresh from module state — this ctx was built before the latch settled.
+    ctx.botUserId = botUserId
+    ctx.selfBotId = selfBotId
+    // Pure guard in lib.ts (ccsc-x0t.3) — testable without importing server.ts.
+    assertManifestIdentityResolved(ctx.botUserId)
+  }
+
   ctx.journalWrite({
     kind: 'gate.outbound.allow',
     outcome: 'allow',
@@ -3162,14 +3223,22 @@ mcp.setNotificationHandler(
     //
     // The permission_request notification carries `input_preview` (string)
     // rather than structured args, so `argEquals` and `pathPrefix`
-    // predicates cannot match from this notification alone. Rules can
-    // still match on `tool`, `channel`, `thread_ts`, and `actor`. Filed
-    // for future work when the MCP surface carries structured input.
+    // predicates cannot be evaluated from this notification alone. We mark
+    // the call `inputAvailable: false` so the evaluator applies the
+    // input-unavailable FAIL-SAFE (ccsc-x0t.5) instead of the old fail-open:
+    // a `deny`/`require_approval` rule whose only unmet field is such a
+    // predicate is routed to a human (never silently skipped), preempting any
+    // later broad `auto_approve`; an `auto_approve` with such a predicate is
+    // skipped. Rules still match fully on `tool`, `channel`, `thread_ts`, and
+    // `actor`. See 000-docs/policy-evaluation-flow.md § Input-unavailable
+    // fail-safe; the boot linter `detectUnenforceablePredicates` names every
+    // affected rule.
     // ---------------------------------------------------------------------
     const sessionThread = lastActiveThread ?? ''
     const policyCall: PolicyToolCall = {
       tool: params.tool_name,
       input: {},
+      inputAvailable: false,
       sessionKey: { channel: targetChannel, thread: sessionThread },
       actor: 'claude_process',
     }
@@ -3289,13 +3358,24 @@ mcp.setNotificationHandler(
     // for the no-opinion case — see release-plan R2).
     let pendingPolicy: PendingPolicyApproval | undefined
     if (route.type === 'require_human' && decision.kind === 'require') {
+      // Honest journaling for the input-unavailable fail-safe (ccsc-x0t.5):
+      // when `evaluate()` routed a deny/require_approval rule to a human
+      // because its pathPrefix/argEquals predicate was unevaluable at this
+      // gate, `decision.reason` is set. Stamp it into the `policy.require`
+      // event's input echo so the signed audit chain records WHY the human
+      // was asked and never implies the predicate was evaluated. A genuine
+      // require_approval match leaves `reason` undefined → echo unchanged.
+      const requireInput =
+        decision.reason !== undefined
+          ? { ...policyInput, failsafeReason: decision.reason }
+          : policyInput
       // Same exhaustive contract as auto_allow above (ccsc-175):
       // require_human → exactly [policy.require], approversNeeded merged
       // into the trace input by the builder.
       for (const ev of permissionRouteJournalEvents(route, {
         sessionKey: policySessionKey,
         toolName: params.tool_name,
-        input: policyInput,
+        input: requireInput,
         approversNeeded: decision.approvers,
       })) {
         journalWrite(ev)
@@ -4184,7 +4264,7 @@ async function tryDispatchAdminVerb(ev: Record<string, unknown>, access: Access)
 
   const deps = {
     isAllowed: (cId: string, uId: string): boolean => {
-      const policy = access.channels[cId]
+      const policy = getChannelPolicy(access, cId)
       return policy?.adminCommands?.allowFrom?.includes(uId) ?? false
     },
     journalWrite: async (input: Parameters<JournalWriter['writeEvent']>[0]): Promise<unknown> => {
@@ -4238,7 +4318,7 @@ async function tryDispatchAdminVerb(ev: Record<string, unknown>, access: Access)
     muteStore: adminMuteStore,
     // ccsc-yl6k9 — effective rate-limit view for the read-only !rate-limit verb.
     getChannelRateLimits: (chId: string) => {
-      const chPolicy = getAccess().channels?.[chId]
+      const chPolicy = getChannelPolicy(getAccess(), chId)
       return {
         peerBot: chPolicy?.peerBotRateLimit ?? DEFAULT_PEER_BOT_RATE_LIMIT,
         channel: chPolicy?.channelCircuitBreaker ?? DEFAULT_CHANNEL_CIRCUIT_BREAKER,
@@ -4638,28 +4718,96 @@ async function main(): Promise<void> {
   deliveryTimer = setInterval(drainOutboxOnce, deliveryPollMs)
   if (typeof deliveryTimer.unref === 'function') deliveryTimer.unref()
 
-  // Resolve bot identity (user ID, bot ID, app ID) for mention detection
-  // and self-echo filtering across payload variants and multi-workspace setups
-  try {
-    const auth = await web.auth.test()
-    botUserId = (auth.user_id as string) || ''
-    selfBotId = (auth.bot_id as string) || ''
-    // app_id may not be present in all auth.test responses; fall back to empty
-    selfAppId = ((auth as unknown as Record<string, unknown>).app_id as string) || ''
-    console.error('[slack] bot identity:', { botUserId, selfBotId, selfAppId })
-  } catch (err) {
-    console.error('[slack] Failed to resolve bot identity:', err)
-  }
-
-  // Connect Socket Mode (Slack ↔ local WebSocket)
-  await socket.start()
-  console.error('[slack] Socket Mode connected')
-
-  // Connect MCP stdio (server ↔ Claude Code)
+  // Connect MCP stdio (server ↔ Claude Code) FIRST. The stdio handshake
+  // has no external dependency and must come up immediately: when
+  // socket.start() (and the web.auth.test() identity call, whose WebClient
+  // defaults to ~30 minutes of internal retries) ran before mcp.connect(),
+  // any Slack-side slowness blew Claude Code's 30s MCP handshake window,
+  // and the client logged a connection timeout and gave up without
+  // retrying — the whole channel stayed dead. Outbound tools
+  // (reply/react/...) use the HTTPS WebClient and work regardless of
+  // Socket Mode state; only inbound events wait on the socket.
   const transport = new StdioServerTransport()
   transport.onclose = () => void shutdown('stdio transport closed')
   await mcp.connect(transport)
   console.error('[slack] MCP server running on stdio')
+
+  // Bring up the Slack side asynchronously: resolve bot identity, then
+  // connect Socket Mode with bounded-backoff retries. Identity resolution
+  // runs here (not before mcp.connect) because it is only consumed by
+  // inbound-event processing — mention detection and self-echo filtering —
+  // and no inbound event can arrive until socket.start() succeeds below.
+  //
+  // The retry loop only guards the initial start(): the @slack/socket-mode
+  // client auto-reconnects once started. Two deliberate exits:
+  //   - shuttingDown → stop retrying; a post-shutdown start() would
+  //     resurrect a socket in a process about to exit (zombie instance
+  //     stealing round-robined events).
+  //   - unrecoverable auth/config errors (revoked or wrong xapp token) →
+  //     fail loud and exit non-zero so the operator sees it at boot,
+  //     instead of retrying a permanently-fatal error forever.
+  void (async () => {
+    // Resolve bot identity (user ID, bot ID, app ID) for mention detection
+    // and self-echo filtering across payload variants and multi-workspace setups
+    try {
+      const auth = await web.auth.test()
+      botUserId = (auth.user_id as string) || ''
+      selfBotId = (auth.bot_id as string) || ''
+      // app_id may not be present in all auth.test responses; fall back to empty
+      selfAppId = ((auth as unknown as Record<string, unknown>).app_id as string) || ''
+      console.error('[slack] bot identity:', { botUserId, selfBotId, selfAppId })
+    } catch (err) {
+      console.error('[slack] Failed to resolve bot identity:', err)
+    } finally {
+      settleIdentity()
+    }
+
+    // Bounded retry: the loop exists to survive a TRANSIENT outage, not to
+    // mask a permanently-dead channel. Auth/config-fatal errors shut down
+    // immediately; anything else (persistent 5xx, proxy blackhole, DNS/TLS
+    // failure — the SDK throws these out of retrieveWSSURL as
+    // RequestError/HTTPError rather than reconnecting internally) gets
+    // MAX_SOCKET_START_ATTEMPTS tries (~5 minutes with the backoff below),
+    // then fails loud the same way. The fatal-vs-retryable decision and the
+    // backoff schedule are pure functions in lib.ts (classifySocketStartError /
+    // nextSocketStartBackoffMs) so the boot-path classification is unit-tested
+    // without importing this module (ccsc-x0t.4 / ccsc-x0t.10).
+    const MAX_SOCKET_START_ATTEMPTS = 10
+    let attempt = 0
+    let delayMs = 2_000
+    while (!shuttingDown) {
+      try {
+        await socket.start()
+        console.error('[slack] Socket Mode connected')
+        return
+      } catch (err) {
+        attempt += 1
+        const msg = err instanceof Error ? err.message : String(err)
+        if (classifySocketStartError(err) === 'fatal') {
+          console.error(
+            '[slack] Socket Mode start failed with unrecoverable error:',
+            extractSlackErrorCode(err) ?? msg,
+          )
+          await shutdown('unrecoverable Socket Mode start error', 1)
+          return
+        }
+        if (attempt >= MAX_SOCKET_START_ATTEMPTS) {
+          console.error(
+            `[slack] Socket Mode start failed ${attempt} consecutive times; giving up:`,
+            msg,
+          )
+          await shutdown('Socket Mode start exhausted retries', 1)
+          return
+        }
+        console.error(
+          `[slack] Socket Mode start failed (attempt ${attempt}/${MAX_SOCKET_START_ATTEMPTS}, retrying in ${Math.round(delayMs / 1000)}s):`,
+          msg,
+        )
+        await new Promise((r) => setTimeout(r, delayMs))
+        delayMs = nextSocketStartBackoffMs(delayMs)
+      }
+    }
+  })()
 
   // Belt-and-suspenders: the SDK's StdioServerTransport doesn't listen for
   // stdin end/close, so transport.onclose never fires on its own. Hook stdin

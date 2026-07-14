@@ -428,6 +428,64 @@ chain and:
 4. A v2 event WITHOUT a `signature` while the verifier holds a key is
    rejected (unsigned event smuggled into a signed chain).
 
+### Verification anchors — closing the head-truncation / downgrade residuals (ccsc-x0t.7)
+
+The genesis-seq pin (`ccsc-x0t` / #264) rejects a *naive* head-shear (drop
+`seq=1`, leave survivors at `seq=2…`). It does **not**, by itself, stop two
+attacks a writer-capable adversary can still mount, both documented as the
+`ccsc-x0t.2` residual:
+
+- **v1 renumber + rechain.** On an *unsigned* (v1) chain the hash chain is a
+  bare keyless SHA-256, so the attacker shears the head, renumbers survivors to
+  `seq=1…`, and recomputes the chain with no secret — it verifies clean.
+- **Uniform downgrade to v1.** Even a *signed* (v2) chain can be rewritten so
+  every event is unsigned v1 (signatures stripped). The verifier's v2→v1
+  rollback check only fires *within* a file once a v2 has been accepted; a
+  file that is uniformly v1 never trips it.
+
+Two optional `VerifyOptions` anchors close these — both are operator-supplied
+out-of-band facts the attacker cannot reproduce from the file alone:
+
+| Option | Rule enforced | Defeats |
+|---|---|---|
+| `pinnedGenesisHash` | the **first** accepted event's `prevHash` MUST equal this exact value | head-shear + rechain (v1 *and* v2): a sheared file's new first event has a different `prevHash` |
+| `v2FloorSeq` | every event with `seq ≥ v2FloorSeq` MUST be `v2` (a v1 event at/after the floor is a break) | uniform downgrade-to-v1 of a chain that was signed from `v2FloorSeq` onward |
+
+The genesis hash is the writer's `initialPrevHash`, chosen at journal creation;
+an operator who records it out-of-band (e.g. alongside the published signing
+key) can pin it. `v2FloorSeq` is the `seq` at which the operator turned signing
+on. Both are exposed on the verify CLI as `--expected-genesis-hash <hex>` and
+`--v2-floor-seq <N>`. Absent either option, verification behaves exactly as
+before — these are additive, opt-in hardening for operators who captured the
+anchors.
+
+These anchors are **contract-level convergent** with the signed-head-checkpoint
+design the sibling [agent-governance-plane](https://github.com/jeremylongshore/agent-governance-plane)
+ships independently (`src/journal/verify.ts`): same idea (an out-of-band pinned
+anchor the file can't self-attest), **CCSC's own implementation, no shared code**
+— both stay runnable standalone (`ccsc-j39`).
+
+### Rotation and slice reseed
+
+`audit.log` grows unbounded; an operator rotating it (archive the old file,
+start a new one) must preserve chain continuity across the boundary. The reseed
+protocol:
+
+1. Note the **last event's `hash`** in the file being archived — call it `H`.
+2. Open the new file with `JournalWriter.open({ initialPrevHash: H, … })`. The
+   writer already supports this (no code change) — the new file's `seq` restarts
+   at 1 but its genesis `prevHash` is `H`, so the two files chain end-to-end.
+3. To verify the new slice in isolation, pass `--expected-genesis-hash H`
+   (the archived file's head). To verify the full history, concatenate the
+   files in order and verify the whole — the seams chain because each new-file
+   genesis `prevHash` equals the prior file's head `hash`.
+
+Rotation is therefore a documented *operator procedure* plus the two verify
+anchors, not a new mechanism in the writer. A rotated-and-anchored history is
+as tamper-evident as an un-rotated one; a rotation that forgets to record `H`
+loses the cross-file link (the new file verifies as its own chain, but nothing
+ties it to the archived prefix — call that out in the runbook).
+
 ### `system.key_rotation` event
 
 | Field | Value |
@@ -508,6 +566,8 @@ verify it from anywhere the repo is checked out.
 
 ```bash
 bun server.ts --verify-audit-log ~/.claude/channels/slack/audit.log
+# Fail if the log has fewer than N events (catches a wiped/truncated log):
+bun server.ts --verify-audit-log ~/.claude/channels/slack/audit.log --min-events 100
 ```
 
 Output contract (stable — operators may grep):
@@ -516,12 +576,26 @@ Output contract (stable — operators may grep):
 - Break: multi-line `FAIL:` block on stderr with `line:`, `seq:`, `ts:`,
   `reason:`, plus `expected:` / `actual:` when applicable and an
   `events verified before break:` tail for truncation forensics.
+- Too short: `FAIL: audit journal too short …` on stderr when `--min-events N`
+  is set and fewer than `N` events verified.
+
+**`--min-events N` — the eventsVerified floor (ccsc-x0t.9).** A hash-clean chain
+that verifies *zero* events (a wiped-to-empty `audit.log`) returns
+`{ ok: true, eventsVerified: 0 }` and would otherwise print `OK: 0 event(s)
+verified` with exit `0` — so a monitoring cron reads a **destroyed log as
+"verified clean."** An operator who knows the log should hold at least `N`
+events passes `--min-events N`; if it has been truncated below that, verification
+**fails** (exit 1). The floor is operator-supplied, not a hard "empty = fail",
+because a first-boot log legitimately has zero events. This is a *lower-bound*
+liveness check on top of the hash-chain integrity check — it does not detect a
+full-file forge (see § Signed events for that), only a shrink.
 
 Exit codes:
 
-- `0` — chain intact end-to-end.
+- `0` — chain intact end-to-end (and ≥ `--min-events` when set).
 - `1` — chain break (hash mismatch, `prevHash` mismatch, `seq` gap,
-  schema violation, version skew, or parse error).
+  schema violation, version skew, or parse error) **or** fewer events than
+  `--min-events`.
 - `2` — unexpected error in the verifier itself (should not happen in
   production; surfaced for operator visibility over a silent success).
 
