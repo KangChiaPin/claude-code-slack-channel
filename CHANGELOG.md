@@ -77,7 +77,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **Bumped `tsx` 4.21.0→4.22.4 to clear an esbuild RCE advisory** (`ccsc-dqu`). [GHSA-gv7w-rqvm-qjhr](https://github.com/advisories/GHSA-gv7w-rqvm-qjhr) (high): `esbuild >=0.17.0 <0.28.1` ships the Deno install module without binary-integrity verification, enabling RCE via a malicious `NPM_CONFIG_REGISTRY`. CCSC pulled `esbuild@0.27.7` transitively through the `tsx` devDependency, which failed the CI `bun audit --audit-level=high` gate on every PR repo-wide. `tsx@4.22.4` (within the existing `^4.21.0` range) pins `esbuild ~0.28.0` → resolves the fixed `0.28.1`. Runtime exposure was nil — `tsx`/`esbuild` are build-time only (the `npx tsx server.ts` Node fallback path); CCSC never invokes esbuild's Deno installer. `bun audit` → 0 high vulnerabilities; typecheck + 1156-test suite green.
 
-## Fork additions (KangChiaPin/feat/owner-role-hook, not upstreamed)
+## Fork additions (KangChiaPin/kjb/main, not upstreamed)
 
 <!-- Carried across upstream merges. Keep separate from [Unreleased] so future
      rebases can replay or upstream them cleanly without scraping prose. -->
