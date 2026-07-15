@@ -2241,13 +2241,25 @@ export function mergeAttachmentTextIntoInbound(
   const flat = flattenSlackAttachments(attachments)
   if (!flat) return text
   meta.forward_count = String(flat.count)
+  if (flat.sourceUrl) meta.forward_source_url = flat.sourceUrl
   return text ? `${text}\n\n${flat.text}` : flat.text
 }
+
+/** Slack canonical message-permalink shape: `/archives/<C…>/p<digits>`
+ *  under a lowercase workspace subdomain. Rejects:
+ *    - non-Slack URLs (arxiv, imgur, etc.)
+ *    - bare /archives/ or /archives/<channel-id> (no permalink)
+ *    - file-share URLs /archives/<channel>/files/<F…> (no p+digits)
+ *    - workflow/canvas/admin routes
+ *  Case-sensitive lower for subdomain — Slack subdomains are lowercase
+ *  in practice; strict matching is intentional.
+ */
+const SLACK_PERMALINK_RE = /^https:\/\/[a-z0-9-]+\.slack\.com\/archives\/[A-Z0-9]+\/p\d+/
 
 export function flattenSlackAttachments(
   attachments: unknown,
   opts: { perCap?: number; totalCap?: number } = {},
-): { text: string; count: number } | null {
+): { text: string; count: number; sourceUrl?: string } | null {
   if (!Array.isArray(attachments) || attachments.length === 0) return null
   const perCap = opts.perCap ?? ATTACHMENT_PER_CAP
   const totalCap = opts.totalCap ?? ATTACHMENT_TOTAL_CAP
@@ -2255,8 +2267,20 @@ export function flattenSlackAttachments(
   const flattened: string[] = []
   let usedChars = 0
   let truncatedByTotal = 0
+  let sourceUrl: string | undefined
 
   for (const att of attachments as Array<Record<string, unknown>>) {
+    // Capture the first Slack canonical permalink we see across
+    // attachments (not just the first attachment — an unfurl may
+    // precede a real forward). First MATCHING wins.
+    if (sourceUrl === undefined) {
+      const fromUrl = att.from_url
+      if (typeof fromUrl === 'string' && fromUrl.trim().length > 0) {
+        if (SLACK_PERMALINK_RE.test(fromUrl)) {
+          sourceUrl = fromUrl
+        }
+      }
+    }
     const parts: string[] = []
     const authorName = typeof att.author_name === 'string' ? att.author_name : ''
     const title = typeof att.title === 'string' ? att.title : ''
@@ -2315,6 +2339,7 @@ export function flattenSlackAttachments(
   return {
     text: `[attached/forwarded]\n${flattened.join('\n---\n')}${suffix}`,
     count: flattened.length,
+    ...(sourceUrl !== undefined ? { sourceUrl } : {}),
   }
 }
 

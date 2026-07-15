@@ -2113,6 +2113,149 @@ describe('mergeAttachmentTextIntoInbound', () => {
     const out = mergeAttachmentTextIntoInbound('', [{ text: 'body' }], meta)
     expect(out.startsWith('[attached/forwarded]')).toBe(true)
   })
+
+  // Slack-permalink extraction into meta.forward_source_url
+  // (plugin-forward-source-url v3 tightened regex to require
+  // /archives/<C…>/p<digits> segment — file-share URLs, admin
+  // pages, and bare /archives/ all rejected; only canonical
+  // message permalinks captured.)
+
+  test('captures Slack permalink into meta.forward_source_url', () => {
+    const meta: Record<string, string> = {}
+    mergeAttachmentTextIntoInbound(
+      '',
+      [
+        {
+          author_name: 'Alice',
+          text: 'hi',
+          from_url: 'https://aetherai.slack.com/archives/C0X/p1720000000',
+        },
+      ],
+      meta,
+    )
+    expect(meta.forward_source_url).toBe('https://aetherai.slack.com/archives/C0X/p1720000000')
+  })
+
+  test('rejects external URL unfurl (arxiv) — meta key absent', () => {
+    const meta: Record<string, string> = {}
+    mergeAttachmentTextIntoInbound(
+      '',
+      [{ text: 'preview', from_url: 'https://arxiv.org/pdf/2401.12345' }],
+      meta,
+    )
+    expect(meta.forward_source_url).toBeUndefined()
+  })
+
+  test('rejects file-share URL under /archives/', () => {
+    const meta: Record<string, string> = {}
+    mergeAttachmentTextIntoInbound(
+      '',
+      [
+        {
+          text: 'file card',
+          from_url: 'https://aetherai.slack.com/archives/C0X/files/F001',
+        },
+      ],
+      meta,
+    )
+    expect(meta.forward_source_url).toBeUndefined()
+  })
+
+  test('rejects bare /archives/ path (no channel + p-timestamp)', () => {
+    const meta: Record<string, string> = {}
+    mergeAttachmentTextIntoInbound(
+      '',
+      [{ text: 'x', from_url: 'https://aetherai.slack.com/archives/' }],
+      meta,
+    )
+    expect(meta.forward_source_url).toBeUndefined()
+  })
+
+  test('rejects /archives/C without p-timestamp', () => {
+    const meta: Record<string, string> = {}
+    mergeAttachmentTextIntoInbound(
+      '',
+      [{ text: 'x', from_url: 'https://aetherai.slack.com/archives/C0X' }],
+      meta,
+    )
+    expect(meta.forward_source_url).toBeUndefined()
+  })
+
+  test('unfurl-first + forward-second populates from the forward', () => {
+    const meta: Record<string, string> = {}
+    mergeAttachmentTextIntoInbound(
+      '',
+      [
+        { text: 'preview', from_url: 'https://arxiv.org/foo' },
+        {
+          text: 'forwarded body',
+          from_url: 'https://aetherai.slack.com/archives/C0X/p1720000000',
+        },
+      ],
+      meta,
+    )
+    expect(meta.forward_source_url).toBe('https://aetherai.slack.com/archives/C0X/p1720000000')
+  })
+
+  test('multi-forward: first matching Slack permalink wins', () => {
+    const meta: Record<string, string> = {}
+    mergeAttachmentTextIntoInbound(
+      '',
+      [
+        {
+          text: 'A',
+          from_url: 'https://aetherai.slack.com/archives/C0X/p1720000001',
+        },
+        {
+          text: 'B',
+          from_url: 'https://aetherai.slack.com/archives/C0X/p1720000002',
+        },
+      ],
+      meta,
+    )
+    expect(meta.forward_source_url).toBe('https://aetherai.slack.com/archives/C0X/p1720000001')
+  })
+
+  test('whitespace-only from_url ignored', () => {
+    const meta: Record<string, string> = {}
+    mergeAttachmentTextIntoInbound('', [{ text: 'x', from_url: '   ' }], meta)
+    expect(meta.forward_source_url).toBeUndefined()
+  })
+
+  test('non-string from_url (null / number) ignored', () => {
+    const meta: Record<string, string> = {}
+    mergeAttachmentTextIntoInbound(
+      '',
+      [
+        { text: 'x', from_url: null } as Record<string, unknown>,
+        { text: 'y', from_url: 42 } as Record<string, unknown>,
+      ],
+      meta,
+    )
+    expect(meta.forward_source_url).toBeUndefined()
+  })
+
+  test('missing from_url leaves meta key absent (forward_count still set)', () => {
+    const meta: Record<string, string> = {}
+    mergeAttachmentTextIntoInbound('', [{ author_name: 'Alice', text: 'body' }], meta)
+    expect(meta.forward_count).toBe('1')
+    expect(meta.forward_source_url).toBeUndefined()
+  })
+
+  test('uppercase workspace subdomain rejected (case-sensitive regex)', () => {
+    const meta: Record<string, string> = {}
+    mergeAttachmentTextIntoInbound(
+      '',
+      [
+        {
+          text: 'x',
+          from_url: 'https://AetherAI.slack.com/archives/C0X/p1720000000',
+        },
+      ],
+      meta,
+    )
+    expect(meta.forward_source_url).toBeUndefined()
+  })
 })
 
 // ---------------------------------------------------------------------------
