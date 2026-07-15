@@ -2241,7 +2241,7 @@ export function mergeAttachmentTextIntoInbound(
   const flat = flattenSlackAttachments(attachments)
   if (!flat) return text
   meta.forward_count = String(flat.count)
-  if (flat.sourceUrl) meta.forward_source_url = flat.sourceUrl
+  if (flat.sourceUrl !== undefined) meta.forward_source_url = flat.sourceUrl
   return text ? `${text}\n\n${flat.text}` : flat.text
 }
 
@@ -2254,7 +2254,8 @@ export function mergeAttachmentTextIntoInbound(
  *  Case-sensitive lower for subdomain — Slack subdomains are lowercase
  *  in practice; strict matching is intentional.
  */
-const SLACK_PERMALINK_RE = /^https:\/\/[a-z0-9-]+\.slack\.com\/archives\/[A-Z0-9]+\/p\d+/
+const SLACK_PERMALINK_RE =
+  /^https:\/\/[a-z0-9-]+(?:\.[a-z0-9-]+)*\.slack\.com\/archives\/[A-Z0-9]+\/p\d+/
 
 export function flattenSlackAttachments(
   attachments: unknown,
@@ -2836,6 +2837,11 @@ export function deriveRoleForSender(
   senderUserId: string,
   ownerUserIdOrMap: string | ReadonlyMap<string, SenderRole>,
 ): SenderRole {
+  // Null-safe guard: caller-supplied ids in production go through
+  // strict `/^[A-Z0-9]{1,32}$/` sanitization first, but this is the
+  // security-critical decision point and a nullish check costs
+  // nothing to future-proof.
+  if (!senderUserId) return 'contributor'
   // Peer-agent hard-code BEFORE map / env lookup. Bot user_ids
   // (B-prefix) can never be owners regardless of what a roles.json
   // map (or a typo'd map with an invalid B-prefix key) says. Without
@@ -2902,6 +2908,14 @@ export function loadRolesFile(jsonText: string): RolesFileParse {
   for (const [key, value] of Object.entries(parsed as Record<string, unknown>)) {
     if (!ROLES_KEY_RE.test(key)) {
       invalidKeys.push(key)
+      // Skip storing invalid-shape keys in the map — they'd never
+      // match a real user_id (which goes through the plugin's
+      // uppercase-only sanitization), but keeping them in the map
+      // is dead weight. Value-side warn still happens below so
+      // operators see the shape complaint AND (if applicable) the
+      // "value isn't owner|contributor" complaint. Fable-code-review
+      // v6 finding.
+      continue
     }
     let role: SenderRole = 'contributor'
     if (value === 'owner') {

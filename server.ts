@@ -4237,14 +4237,29 @@ async function handleMessage(event: unknown): Promise<void> {
           } catch (err) {
             console.error('[slack] cannedReply chat.postMessage failed', err)
           }
-          if (access.deniedDmOwnerPing && OWNER_USER_ID && senderId) {
+          // roles-map v3: pick the DM target — prefer the legacy
+          // OWNER_USER_ID for backward-compat, else the first
+          // 'owner' key from the rolesMap. Without this fallback,
+          // migrating to SLACK_ROLES_FILE + unsetting
+          // OWNER_SLACK_USER_ID silently disables the owner-ping
+          // alerting for unauthorized DMs (Fable-code-review v6 M1).
+          let ownerDmTarget = OWNER_USER_ID
+          if (!ownerDmTarget && rolesMap) {
+            for (const [uid, role] of rolesMap) {
+              if (role === 'owner') {
+                ownerDmTarget = uid
+                break
+              }
+            }
+          }
+          if (access.deniedDmOwnerPing && ownerDmTarget && senderId) {
             const rawText = typeof ev.text === 'string' ? ev.text : ''
             const preview = rawText.length > 120 ? `${rawText.slice(0, 120)}…` : rawText
             const previewLine = preview ? `\n> ${preview.replace(/\n/g, ' ')}` : ''
             const ownerNotice = `📬 Unauthorized DM — <@${senderId}> tried to DM me.${previewLine}\n\nAdd to allowlist (edit .slack-state/access.json) or ignore. Same sender silenced for ${Math.round(cooldownSec / 60)} min.`
             try {
               await web.chat.postMessage({
-                channel: OWNER_USER_ID,
+                channel: ownerDmTarget,
                 text: ownerNotice,
                 unfurl_links: false,
                 unfurl_media: false,

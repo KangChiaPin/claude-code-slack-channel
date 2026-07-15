@@ -2256,6 +2256,47 @@ describe('mergeAttachmentTextIntoInbound', () => {
     )
     expect(meta.forward_source_url).toBeUndefined()
   })
+
+  // Orthogonal tests suggested by Fable code-review v6:
+
+  test('Enterprise Grid subdomain (multi-dot host) accepted', () => {
+    const meta: Record<string, string> = {}
+    mergeAttachmentTextIntoInbound(
+      '',
+      [
+        {
+          text: 'x',
+          from_url: 'https://myorg.enterprise.slack.com/archives/C0X/p1720000000',
+        },
+      ],
+      meta,
+    )
+    expect(meta.forward_source_url).toBe(
+      'https://myorg.enterprise.slack.com/archives/C0X/p1720000000',
+    )
+  })
+
+  test('permalink with query-string (thread_ts) preserved verbatim', () => {
+    // Slack thread-permalinks carry ?thread_ts=...&cid=... that
+    // downstream consumers need to distinguish thread-reply from
+    // top-level. Regex is prefix-anchored so the query string
+    // survives.
+    const meta: Record<string, string> = {}
+    mergeAttachmentTextIntoInbound(
+      '',
+      [
+        {
+          text: 'x',
+          from_url:
+            'https://aetherai.slack.com/archives/C0X/p1720000000?thread_ts=1720000000.000100&cid=C0X',
+        },
+      ],
+      meta,
+    )
+    expect(meta.forward_source_url).toBe(
+      'https://aetherai.slack.com/archives/C0X/p1720000000?thread_ts=1720000000.000100&cid=C0X',
+    )
+  })
 })
 
 // ---------------------------------------------------------------------------
@@ -19620,6 +19661,22 @@ describe('deriveRoleForSender', () => {
     const map = new Map<string, 'owner' | 'contributor'>([['U0111', 'contributor']])
     expect(deriveRoleForSender('U0111', map)).toBe('contributor')
   })
+
+  // Orthogonal tests suggested by Fable code-review v6:
+
+  test('empty senderUserId → contributor in both modes (null-safe guard)', async () => {
+    const { deriveRoleForSender } = await loadLib()
+    const map = new Map<string, 'owner' | 'contributor'>([['U0111', 'owner']])
+    expect(deriveRoleForSender('', map)).toBe('contributor')
+    expect(deriveRoleForSender('', 'U0111')).toBe('contributor')
+    expect(deriveRoleForSender('', new Map())).toBe('contributor')
+  })
+
+  test('W-prefix (Enterprise Grid member) works in map mode', async () => {
+    const { deriveRoleForSender } = await loadLib()
+    const map = new Map<string, 'owner' | 'contributor'>([['W0MEMBER', 'owner']])
+    expect(deriveRoleForSender('W0MEMBER', map)).toBe('owner')
+  })
 })
 
 describe('loadRolesFile', () => {
@@ -19678,12 +19735,15 @@ describe('loadRolesFile', () => {
     expect(unknownValues.filter((v) => v === '"reviewer"').length).toBe(1)
   })
 
-  test('invalid-shape key (lowercase u) is stored but collected', async () => {
+  test('invalid-shape key (lowercase u) is skipped from map but collected for warn', async () => {
     const { loadRolesFile } = await loadLib()
     const { map, invalidKeys } = loadRolesFile('{"u0111": "owner"}')
-    // Key is stored (harmless — no real U-prefix user_id will match)
-    // but flagged for one-shot operator warn.
-    expect(map.get('u0111')).toBe('owner')
+    // Invalid-shape keys are NOT stored in the map — no legitimate
+    // sender_id can match them (plugin sanitizes to uppercase), and
+    // storing them is dead weight. Only collected for one-shot warn.
+    // (Fable code-review v6 finding — dropped keys are safer than
+    // stored keys against future callers that skip the sanitizer.)
+    expect(map.has('u0111')).toBe(false)
     expect(invalidKeys).toEqual(['u0111'])
   })
 
@@ -19693,10 +19753,14 @@ describe('loadRolesFile', () => {
     expect(invalidKeys).toEqual(['alice'])
   })
 
-  test('B-prefix key stored + flagged invalid (bots can never be owners)', async () => {
+  test('B-prefix key skipped from map + flagged invalid (bots can never be owners)', async () => {
     const { loadRolesFile } = await loadLib()
     const { map, invalidKeys } = loadRolesFile('{"B0BOT": "owner"}')
-    expect(map.get('B0BOT')).toBe('owner')
+    // B-prefix bot IDs are excluded from ROLES_KEY_RE, so
+    // loadRolesFile treats them as invalid-shape and skips storage.
+    // Additionally, deriveRoleForSender hard-codes B-prefix → contributor
+    // even if a downstream path did store them — double belt+suspenders.
+    expect(map.has('B0BOT')).toBe(false)
     expect(invalidKeys).toContain('B0BOT')
   })
 
@@ -19715,5 +19779,45 @@ describe('loadRolesFile', () => {
     expect(() => loadRolesFile('"foo"')).toThrow(/expected JSON object/)
     expect(() => loadRolesFile('42')).toThrow(/expected JSON object/)
     expect(() => loadRolesFile('null')).toThrow(/expected JSON object/)
+  })
+
+  // Orthogonal tests suggested by Fable code-review v6:
+
+  test('W-prefix (Enterprise Grid workspace member) accepted as owner', async () => {
+    const { loadRolesFile } = await loadLib()
+    const { map, invalidKeys } = loadRolesFile('{"W0MEMBER": "owner"}')
+    // W-prefix is a valid Slack user_id shape (Enterprise Grid).
+    expect(map.get('W0MEMBER')).toBe('owner')
+    expect(invalidKeys).toEqual([])
+  })
+
+  test('prototype-pollution keys (__proto__, constructor) rejected', async () => {
+    const { loadRolesFile } = await loadLib()
+    const { map, invalidKeys } = loadRolesFile('{"__proto__": "owner", "constructor": "owner"}')
+    // Neither matches ROLES_KEY_RE (`_` and `c` starts).
+    // Both are flagged as invalidKeys and NOT stored.
+    expect(map.has('__proto__')).toBe(false)
+    expect(map.has('constructor')).toBe(false)
+    expect(invalidKeys).toContain('__proto__')
+    expect(invalidKeys).toContain('constructor')
+    // And critically: no prototype pollution — reading `.owner` off
+    // a fresh plain object returns undefined.
+    const probe: Record<string, unknown> = {}
+    expect(probe.owner).toBeUndefined()
+  })
+
+  test('unicode + null-byte keys rejected', async () => {
+    const { loadRolesFile } = await loadLib()
+    // Null-byte in key: fails ROLES_KEY_RE.
+    const { map, invalidKeys } = loadRolesFile('{"U0111\\u0000EXTRA": "owner"}')
+    expect(map.size).toBe(0)
+    expect(invalidKeys.length).toBe(1)
+  })
+
+  test('emoji value coerces to contributor + collected', async () => {
+    const { loadRolesFile } = await loadLib()
+    const { map, unknownValues } = loadRolesFile('{"U0111": "🤖"}')
+    expect(map.get('U0111')).toBe('contributor')
+    expect(unknownValues).toContain('"🤖"')
   })
 })
