@@ -59,6 +59,7 @@ import {
   deliveredThreadKey as libDeliveredThreadKey,
   gate as libGate,
   listSessions as libListSessions,
+  loadRolesFile,
   makeIdempotentSend,
   mergeAttachmentTextIntoInbound,
   nextSocketStartBackoffMs,
@@ -229,7 +230,86 @@ try {
 // that need to gate at the filesystem layer.
 const OWNER_USER_ID = process.env.OWNER_SLACK_USER_ID || ''
 const ROLE_HOOK_FILE = process.env.SLACK_ROLE_HOOK_FILE || ''
-const ROLE_HOOK_ENABLED = OWNER_USER_ID !== '' && ROLE_HOOK_FILE !== ''
+const ROLES_FILE = process.env.SLACK_ROLES_FILE || ''
+// roles-map v3: role-hook is enabled when SLACK_ROLE_HOOK_FILE is set AND
+// at least one authoritative source is configured (legacy env var or
+// roles.json). This allows deployments that migrate to SLACK_ROLES_FILE
+// to `unset OWNER_SLACK_USER_ID` without silently disabling the sidecar
+// write path (Fable v2 F2-new fix).
+const ROLE_HOOK_ENABLED = ROLE_HOOK_FILE !== '' && (OWNER_USER_ID !== '' || ROLES_FILE !== '')
+
+/** In-memory role map + last-loaded mtime, populated at boot from
+ *  SLACK_ROLES_FILE when set. Undefined when the env var is unset or
+ *  file was unreadable at boot (legacy path — deriveRoleForSender
+ *  falls back to `OWNER_USER_ID` string comparison). */
+let rolesMap: Map<string, SenderRole> | undefined
+let rolesMtimeMs = -1
+/** Track distinct unknown-value strings we've already warned about so
+ *  we emit one stderr warn per string per process — noisy roles.json
+ *  edits don't spam logs. */
+const rolesUnknownWarned = new Set<string>()
+const rolesInvalidKeyWarned = new Set<string>()
+
+/** Load or reload the roles map from `ROLES_FILE`. Called at boot AND
+ *  per-inbound (mtime-gated — skip work if the file hasn't changed).
+ *  On any error, keep the previous in-memory map + log stderr. */
+function tryLoadRolesMap(): void {
+  if (ROLES_FILE === '') return
+  let stat
+  try {
+    stat = statSync(ROLES_FILE)
+  } catch {
+    // File missing / not readable — legacy path handles fallback.
+    return
+  }
+  if (stat.mtimeMs <= rolesMtimeMs) return // no change since last load
+  let text: string
+  try {
+    text = readFileSync(ROLES_FILE, 'utf8')
+  } catch (err) {
+    console.error(
+      `[slack] roles.json read failed at ${ROLES_FILE}: ${
+        err instanceof Error ? err.message : String(err)
+      } — keeping previous map`,
+    )
+    return
+  }
+  try {
+    const parsed = loadRolesFile(text)
+    for (const v of parsed.unknownValues) {
+      if (rolesUnknownWarned.has(v)) continue
+      rolesUnknownWarned.add(v)
+      console.error(`[slack] roles.json: unknown role value ${v} coerced to "contributor"`)
+    }
+    for (const k of parsed.invalidKeys) {
+      if (rolesInvalidKeyWarned.has(k)) continue
+      rolesInvalidKeyWarned.add(k)
+      console.error(
+        `[slack] roles.json: key ${JSON.stringify(k)} does not match Slack user_id shape [UW][A-Z0-9]{1,32}; stored but will never match a real user`,
+      )
+    }
+    rolesMap = parsed.map
+    rolesMtimeMs = stat.mtimeMs
+  } catch (err) {
+    console.error(
+      `[slack] roles.json parse failed at ${ROLES_FILE}: ${
+        err instanceof Error ? err.message : String(err)
+      } — keeping previous map`,
+    )
+  }
+}
+
+// Initial load at boot. Subsequent loads are per-inbound mtime-gated.
+tryLoadRolesMap()
+
+/** Resolve the role-derivation source for a given inbound sender.
+ *  Map-mode when roles.json is loaded; legacy env-var-mode otherwise.
+ *  Peer-agent hard-code (B-prefix user_id) is applied inside
+ *  deriveRoleForSender itself — no caller responsibility.
+ */
+function deriveRoleNow(senderUserId: string): SenderRole {
+  return deriveRoleForSender(senderUserId, rolesMap ?? OWNER_USER_ID)
+}
 
 /** Per-sender cooldown timestamps (ms epoch of last canned-reply / owner-ping
  *  emission) for the denied-DM flow. Module-scope in-memory state — restart
@@ -2515,15 +2595,19 @@ async function handleChoiceClick(
   }
   if (threadTs) meta.thread_ts = threadTs
 
+  // roles-map: reload if roles.json changed since last inbound.
+  tryLoadRolesMap()
+  let derivedRole: SenderRole | undefined
   if (ROLE_HOOK_ENABLED) {
-    const role = deriveRoleForSender(userIdSafe, OWNER_USER_ID)
-    meta.role = role
-    writeRoleHookFileAtomic(ROLE_HOOK_FILE, role)
+    derivedRole = deriveRoleNow(userIdSafe)
+    meta.role = derivedRole
+    writeRoleHookFileAtomic(ROLE_HOOK_FILE, derivedRole)
   }
 
   journalWrite({
     kind: 'gate.inbound.deliver',
     outcome: 'allow',
+    ...(derivedRole !== undefined ? { role: derivedRole } : {}),
     actor: 'session_owner',
     input: {
       channel: channelId,
@@ -3868,11 +3952,35 @@ async function deliverEvent(ev: Record<string, unknown>, access: Access): Promis
   const threadKey = incomingThreadTs ?? (ev.ts as string)
   const sessionKey = inboundSessionKey(channelId, threadKey, access, ev)
 
+  // roles-map v3: reload map if changed, then derive role BEFORE the
+  // journal write so gate.inbound.deliver can record it. Fable v3
+  // F3-v3 fix — v2 had the role derivation ~200 lines later, causing
+  // the delivery-path journal to lack role while the callback path
+  // already had it. Now consistent.
+  //
+  // Hoist userIdSafe derivation up from the meta-build section below;
+  // safe because it's a pure function of ev.user with no side effects.
+  const rawUserIdForJournal = ev.user as string
+  const userIdSafeForJournal = /^[A-Z0-9]{1,32}$/.test(rawUserIdForJournal)
+    ? rawUserIdForJournal
+    : 'invalid'
+  tryLoadRolesMap()
+  let derivedRole: SenderRole | undefined
+  if (ROLE_HOOK_ENABLED) {
+    // Peer-agent inbounds (ev.bot_id set) skip the map and record
+    // 'contributor' unconditionally. deriveRoleForSender's B-prefix
+    // hard-code handles the case where userIdSafeForJournal is the
+    // bot's B-prefix user_id; explicit assignment here covers the
+    // path where ev.bot_id is set but ev.user is undefined.
+    derivedRole = ev.bot_id ? 'contributor' : deriveRoleNow(userIdSafeForJournal)
+  }
+
   journalWrite({
     kind: 'gate.inbound.deliver',
     outcome: 'allow',
     actor: ev.bot_id ? 'peer_agent' : 'session_owner',
     sessionKey,
+    ...(derivedRole !== undefined ? { role: derivedRole } : {}),
     input: {
       channel: channelId,
       user: ev.bot_id ? (ev.bot_id as string) : (ev.user as string | undefined),
@@ -4063,14 +4171,15 @@ async function deliverEvent(ev: Record<string, unknown>, access: Access): Promis
   // tests) live in flattenSlackAttachments.
   text = mergeAttachmentTextIntoInbound(text, ev.attachments, meta)
 
-  // Optional role-hook integration (no-op unless OWNER_SLACK_USER_ID +
-  // SLACK_ROLE_HOOK_FILE are both set; see boot-time constants above).
-  // user_id is the trustworthy Slack-set identifier — see comment on the
-  // `userIdSafe` derivation above.
-  if (ROLE_HOOK_ENABLED) {
-    const role = deriveRoleForSender(userIdSafe, OWNER_USER_ID)
-    meta.role = role
-    writeRoleHookFileAtomic(ROLE_HOOK_FILE, role)
+  // Optional role-hook integration (no-op unless SLACK_ROLE_HOOK_FILE
+  // is set AND at least one authoritative source — OWNER_SLACK_USER_ID
+  // or SLACK_ROLES_FILE — is configured; see boot-time constants above).
+  // Role was already derived above the journal-write; reuse to avoid
+  // double-computing (and to guarantee sidecar + journal + meta all
+  // agree on the same derived value).
+  if (derivedRole !== undefined) {
+    meta.role = derivedRole
+    writeRoleHookFileAtomic(ROLE_HOOK_FILE, derivedRole)
   }
 
   // Push into Claude Code session via MCP notification

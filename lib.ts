@@ -2832,9 +2832,102 @@ export type SenderRole = 'owner' | 'contributor'
  *  Returns "contributor" for the empty-owner sentinel so a misconfigured
  *  OWNER_SLACK_USER_ID="" does not silently promote everyone to owner.
  */
-export function deriveRoleForSender(senderUserId: string, ownerUserId: string): SenderRole {
-  if (!ownerUserId) return 'contributor'
-  return senderUserId === ownerUserId ? 'owner' : 'contributor'
+export function deriveRoleForSender(
+  senderUserId: string,
+  ownerUserIdOrMap: string | ReadonlyMap<string, SenderRole>,
+): SenderRole {
+  // Peer-agent hard-code BEFORE map / env lookup. Bot user_ids
+  // (B-prefix) can never be owners regardless of what a roles.json
+  // map (or a typo'd map with an invalid B-prefix key) says. Without
+  // this hard-code, a roles.json containing `{"B0BOT": "owner"}`
+  // would produce split-brain between sidecar (owner via map) and
+  // journal (contributor via peer-agent path). Fable v3 F1-v3 fix.
+  if (senderUserId.startsWith('B')) return 'contributor'
+
+  if (typeof ownerUserIdOrMap === 'string') {
+    // Legacy env-var-only path — kept for backward compatibility
+    // with deployments that haven't migrated to SLACK_ROLES_FILE.
+    if (!ownerUserIdOrMap) return 'contributor'
+    return senderUserId === ownerUserIdOrMap ? 'owner' : 'contributor'
+  }
+
+  // Map path — roles.json loaded via loadRolesFile.
+  return ownerUserIdOrMap.get(senderUserId) ?? 'contributor'
+}
+
+/** Result of parsing `roles.json`. `map` is the derived
+ *  user_id → role table (keys already validated); `unknownValues`
+ *  and `invalidKeys` collect strings that failed validation for
+ *  one-shot stderr warnings at the call site.
+ */
+export interface RolesFileParse {
+  map: Map<string, SenderRole>
+  unknownValues: string[]
+  invalidKeys: string[]
+}
+
+/** Slack user_id shape: U-prefix (users) or W-prefix (workspace
+ *  members), uppercase alphanumeric, 1-32 chars. Bot user_ids
+ *  (B-prefix) are intentionally EXCLUDED — bots can't be owners
+ *  per the peer-agent hard-code in `deriveRoleForSender`. */
+const ROLES_KEY_RE = /^[UW][A-Z0-9]{1,32}$/
+
+/** Parse a JSON object into a role map with defensive coercion.
+ *
+ *  Contract:
+ *    - Non-string values (`null`, numbers, arrays) coerce to
+ *      `contributor` — collected in `unknownValues` for one-shot warn.
+ *    - Non-`owner`/`contributor` strings (`"Owner"` case-mismatch,
+ *      `"reviewer"`, typos) coerce to `contributor` — same collection.
+ *    - Keys not matching `ROLES_KEY_RE` are STORED (harmless — no
+ *      real user_id will match `"u0111"` lowercase) but collected in
+ *      `invalidKeys` for a shape-warning nudge to the operator.
+ *    - Empty map `{}` is valid and means every sender is contributor.
+ *
+ *  Throws on malformed JSON or non-object shape (array, string,
+ *  number, null). Callers should catch and keep the previous map.
+ */
+export function loadRolesFile(jsonText: string): RolesFileParse {
+  const parsed = JSON.parse(jsonText) as unknown
+  if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    throw new Error(
+      `loadRolesFile: expected JSON object at top level, got ${
+        parsed === null ? 'null' : Array.isArray(parsed) ? 'array' : typeof parsed
+      }`,
+    )
+  }
+  const map = new Map<string, SenderRole>()
+  const unknownValues = new Set<string>()
+  const invalidKeys: string[] = []
+  for (const [key, value] of Object.entries(parsed as Record<string, unknown>)) {
+    if (!ROLES_KEY_RE.test(key)) {
+      invalidKeys.push(key)
+    }
+    let role: SenderRole = 'contributor'
+    if (value === 'owner') {
+      role = 'owner'
+    } else if (value === 'contributor') {
+      role = 'contributor'
+    } else {
+      // Anything else — null, non-owner string, number, array — is
+      // recorded as an unknown-value string for one-shot warning.
+      // Represent the shape stably for humans reading stderr.
+      const repr =
+        value === null
+          ? 'null'
+          : typeof value === 'string'
+            ? `"${value}"`
+            : typeof value === 'number' || typeof value === 'boolean'
+              ? String(value)
+              : Array.isArray(value)
+                ? 'array'
+                : 'object'
+      unknownValues.add(repr)
+      role = 'contributor'
+    }
+    map.set(key, role)
+  }
+  return { map, unknownValues: Array.from(unknownValues), invalidKeys }
 }
 
 export function parseVerifyArg(argv: ReadonlyArray<string>): string | null {

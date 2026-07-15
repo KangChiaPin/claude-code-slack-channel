@@ -357,6 +357,23 @@ export const JournalEvent = z
      *  policy.json is loaded, and on v2 events for which no policy
      *  was in effect (boot/shutdown). */
     policy_attestation: PolicyAttestation.optional(),
+
+    /** Derived role of the inbound sender at the moment of delivery.
+     *  Present only on `gate.inbound.deliver` events emitted while
+     *  role-hook is enabled (either legacy `OWNER_SLACK_USER_ID` env
+     *  or the roles-map `SLACK_ROLES_FILE`). Peer-agent inbounds
+     *  (B-prefix `user_id`) record `contributor` unconditionally —
+     *  bots aren't owners regardless of what a rules file says.
+     *
+     *  Redaction: role is NOT a secret; the redactor allowlists it
+     *  passing through unchanged. It's carried in the clear so
+     *  offline audit queries can filter by owner-vs-contributor
+     *  without post-processing the canonical bytes.
+     *
+     *  Absent on all other event kinds and on delivery events
+     *  emitted with role-hook disabled — this preserves backward
+     *  compatibility with pre-roles-map audit chains. */
+    role: z.enum(['owner', 'contributor']).optional(),
   })
   .strict()
 

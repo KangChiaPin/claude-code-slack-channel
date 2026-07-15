@@ -19580,4 +19580,140 @@ describe('deriveRoleForSender', () => {
     expect(deriveRoleForSender('U12345EXTRA', 'U12345')).toBe('contributor')
     expect(deriveRoleForSender('U12345', 'U12345EXTRA')).toBe('contributor')
   })
+
+  // roles-map v3 additions: map-mode overload + peer-agent hardcode.
+
+  test('peer-agent B-prefix user_id → contributor (hardcode BEFORE map lookup)', async () => {
+    const { deriveRoleForSender } = await loadLib()
+    // Even if a typo'd map lists B0BOT as owner, the peer-agent
+    // hardcode short-circuits to contributor. This is the split-brain
+    // preventive from Fable v3 F1-v3.
+    const map = new Map<string, 'owner' | 'contributor'>([['B0BOT', 'owner']])
+    expect(deriveRoleForSender('B0BOT', map)).toBe('contributor')
+    expect(deriveRoleForSender('B0BOT', 'B0BOT')).toBe('contributor')
+  })
+
+  test('map-mode: sender in map with owner → owner', async () => {
+    const { deriveRoleForSender } = await loadLib()
+    const map = new Map<string, 'owner' | 'contributor'>([
+      ['U0111', 'owner'],
+      ['U0222', 'owner'],
+    ])
+    expect(deriveRoleForSender('U0111', map)).toBe('owner')
+    expect(deriveRoleForSender('U0222', map)).toBe('owner')
+  })
+
+  test('map-mode: sender absent from map → contributor', async () => {
+    const { deriveRoleForSender } = await loadLib()
+    const map = new Map<string, 'owner' | 'contributor'>([['U0111', 'owner']])
+    expect(deriveRoleForSender('U0333', map)).toBe('contributor')
+  })
+
+  test('map-mode: empty map → everyone contributor', async () => {
+    const { deriveRoleForSender } = await loadLib()
+    const map = new Map<string, 'owner' | 'contributor'>()
+    expect(deriveRoleForSender('U0111', map)).toBe('contributor')
+  })
+
+  test('map-mode: sender marked contributor in map → contributor', async () => {
+    const { deriveRoleForSender } = await loadLib()
+    const map = new Map<string, 'owner' | 'contributor'>([['U0111', 'contributor']])
+    expect(deriveRoleForSender('U0111', map)).toBe('contributor')
+  })
+})
+
+describe('loadRolesFile', () => {
+  const loadLib = async () => await import('./lib.ts')
+
+  test('valid single owner', async () => {
+    const { loadRolesFile } = await loadLib()
+    const { map, unknownValues, invalidKeys } = loadRolesFile('{"U0111": "owner"}')
+    expect(map.get('U0111')).toBe('owner')
+    expect(unknownValues).toEqual([])
+    expect(invalidKeys).toEqual([])
+  })
+
+  test('multiple owners', async () => {
+    const { loadRolesFile } = await loadLib()
+    const { map } = loadRolesFile('{"U0111": "owner", "U0222": "owner", "W0333": "owner"}')
+    expect(map.get('U0111')).toBe('owner')
+    expect(map.get('U0222')).toBe('owner')
+    expect(map.get('W0333')).toBe('owner')
+    expect(map.size).toBe(3)
+  })
+
+  test('empty map is valid', async () => {
+    const { loadRolesFile } = await loadLib()
+    const { map, unknownValues, invalidKeys } = loadRolesFile('{}')
+    expect(map.size).toBe(0)
+    expect(unknownValues).toEqual([])
+    expect(invalidKeys).toEqual([])
+  })
+
+  test('unknown role value coerces to contributor + collects for warn', async () => {
+    const { loadRolesFile } = await loadLib()
+    const { map, unknownValues } = loadRolesFile('{"U0111": "reviewer", "U0222": "Owner"}')
+    expect(map.get('U0111')).toBe('contributor')
+    expect(map.get('U0222')).toBe('contributor') // case-sensitive; "Owner" != "owner"
+    expect(unknownValues).toContain('"reviewer"')
+    expect(unknownValues).toContain('"Owner"')
+  })
+
+  test('null / number / array value → contributor + unknownValues', async () => {
+    const { loadRolesFile } = await loadLib()
+    const { map, unknownValues } = loadRolesFile('{"U0111": null, "U0222": 42, "U0333": []}')
+    expect(map.get('U0111')).toBe('contributor')
+    expect(map.get('U0222')).toBe('contributor')
+    expect(map.get('U0333')).toBe('contributor')
+    expect(unknownValues).toContain('null')
+    expect(unknownValues).toContain('42')
+    expect(unknownValues).toContain('array')
+  })
+
+  test('unknownValues deduplicates repeats', async () => {
+    const { loadRolesFile } = await loadLib()
+    const { unknownValues } = loadRolesFile(
+      '{"U0111": "reviewer", "U0222": "reviewer", "U0333": "reviewer"}',
+    )
+    expect(unknownValues.filter((v) => v === '"reviewer"').length).toBe(1)
+  })
+
+  test('invalid-shape key (lowercase u) is stored but collected', async () => {
+    const { loadRolesFile } = await loadLib()
+    const { map, invalidKeys } = loadRolesFile('{"u0111": "owner"}')
+    // Key is stored (harmless — no real U-prefix user_id will match)
+    // but flagged for one-shot operator warn.
+    expect(map.get('u0111')).toBe('owner')
+    expect(invalidKeys).toEqual(['u0111'])
+  })
+
+  test('invalid-shape key (display name) collected', async () => {
+    const { loadRolesFile } = await loadLib()
+    const { invalidKeys } = loadRolesFile('{"alice": "owner"}')
+    expect(invalidKeys).toEqual(['alice'])
+  })
+
+  test('B-prefix key stored + flagged invalid (bots can never be owners)', async () => {
+    const { loadRolesFile } = await loadLib()
+    const { map, invalidKeys } = loadRolesFile('{"B0BOT": "owner"}')
+    expect(map.get('B0BOT')).toBe('owner')
+    expect(invalidKeys).toContain('B0BOT')
+  })
+
+  test('malformed JSON throws', async () => {
+    const { loadRolesFile } = await loadLib()
+    expect(() => loadRolesFile('{ this is not json')).toThrow()
+  })
+
+  test('non-object JSON (array) throws', async () => {
+    const { loadRolesFile } = await loadLib()
+    expect(() => loadRolesFile('["U0111"]')).toThrow(/expected JSON object/)
+  })
+
+  test('non-object JSON (string / number / null) throws', async () => {
+    const { loadRolesFile } = await loadLib()
+    expect(() => loadRolesFile('"foo"')).toThrow(/expected JSON object/)
+    expect(() => loadRolesFile('42')).toThrow(/expected JSON object/)
+    expect(() => loadRolesFile('null')).toThrow(/expected JSON object/)
+  })
 })
