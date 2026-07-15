@@ -1550,6 +1550,14 @@ async function maybeBeginDurableStream(
   threadTs: string | undefined,
   text: string,
 ): Promise<DurableStreamHandle | null> {
+  // kjb fork patch: opt out of the ccsc-o7x.6 stream-finalize obligation via
+  // env. Upstream's poller races the stream-finalize pending obligation
+  // against an in-progress stream and double-posts on long replies (no
+  // idempotency-key stamped on streamReply's initial post; poller's
+  // findDelivered can't recognize the stream's own message). Small owner-driven
+  // fleet doesn't need mid-stream crash recovery: on crash the owner sees a
+  // partial reply and re-asks. Every topic bot.env sets this to 1.
+  if (process.env.SLACK_DISABLE_DURABLE_STREAM === '1') return null
   if (supervisor === null || threadTs === undefined) return null
   try {
     return await beginDurableStream(
