@@ -3,58 +3,154 @@
 Divergences from `upstream/main` (jeremylongshore/claude-code-slack-channel).
 Read before rebasing on upstream so nothing silently disappears in a merge.
 
-## Active patches
+Verify with:
 
-### `maybeBeginDurableStream` env-guard — `SLACK_DISABLE_DURABLE_STREAM=1`
+```
+git log --oneline upstream/main..kjb/main
+git diff upstream/main..kjb/main --stat
+```
 
-- Commit: `3c656f8` (2026-07-15).
-- Location: `server.ts:1550-1558` (top of `maybeBeginDurableStream`, before the
-  `supervisor === null` guard).
-- Diff:
+Fork carries **28 commits** ahead of upstream (as of 640adfd). The list
+below groups them into functional clusters. Merges + reverts are noted
+but not counted as separate patches.
 
-  ```
-  async function maybeBeginDurableStream(...) {
-  +  if (process.env.SLACK_DISABLE_DURABLE_STREAM === '1') return null
-     if (supervisor === null || threadTs === undefined) return null
-     ...
-  ```
+## Cluster A — Owner role hook (host-side gating)
 
-- Motivation: the ccsc-o7x.6 stream-finalize obligation races the outbox
-  delivery poller on long streams, causing double-post. Upstream's model has
-  no signal for "stream is currently in progress" that the poller can honour
-  — pending obligation is indistinguishable from a crash-pending one.
-- Trade-off: crash mid-stream leaves a partial Slack message with no
-  redelivery. Acceptable for owner-driven fleets; the operator re-asks.
-- Rebase discipline: if upstream refactors this function, the guard block
-  above still applies AT THE TOP of whatever the replacement is called.
-  Re-apply if the merge dropped it.
-- Fleet wiring: `agent-seed/templates/topic-mcp.json` includes
-  `SLACK_DISABLE_DURABLE_STREAM` in the plugin's env whitelist,
-  `agent-seed/tools/create-topic.sh` seeds `=1` in every new bot.env, and
-  `agent-seed/tools/run-topic.sh` migrates existing bot.envs on first run.
+The foundational fork feature: derive an owner/contributor role from
+each inbound Slack message and emit it via a filesystem hook so the
+host (agent-seed) can enforce role-gated tool calls at Claude Code's
+PreToolUse layer.
 
-### Owner-role hook + `SLACK_ROLES_FILE` multi-owner map
+- `7bd59d9` — base feature: optional owner-role hook (env-configured,
+  writes `.current-role` on inbound).
+- `e6d42fc` → `587edc5` — thread_ts + timestamp in hook file
+  (subsequently reverted; original writeRoleHookFileAtomic contract
+  is what ships).
+- `f00a69b` — `SLACK_ROLES_FILE` multi-owner map + peer-agent
+  B-prefix hardcode + `role` field on journal events. Load-bearing
+  security path (`gate()`, `deriveRoleForSender`, `loadRolesFile`).
+- `ce04f6f` — code-review v6 findings sweep + orthogonal tests on the
+  roles-map cluster.
 
-- Commits: `5f49aa2`, `f00a69b`, and the fork-history predecessors.
-- Locations across `server.ts` / `lib.ts` / `journal.ts`.
-- See commit bodies for the full contract. This is the deepest divergence
-  from upstream and is the reason `kjb/main` is not a candidate for a
-  clean upstream PR.
+**Files touched**: `server.ts`, `lib.ts`, `journal.ts` (schema),
+plus test files.
 
-### Slack forward-source-url extraction on `flattenSlackAttachments`
+**Rebase discipline**: this cluster is the deepest divergence. A
+noisy merge that drops `deriveRoleForSender` or the `loadRolesFile`
+map path silently breaks role enforcement upstream. Re-verify tests
+after any rebase touches `gate()` or the inbound dispatcher.
 
-- Commit: `5f49aa2`.
-- Location: `lib.ts` around `flattenSlackAttachments`.
-- Populates `meta.forward_source_url` from Slack canonical permalinks
-  inside forward attachments, used by agent-seed's `forward-to-DM
-  quick memory` mechanism.
+## Cluster B — Attachment / forward flattening
+
+Flattens Slack's `attachments[]` payloads (which is where "Forward"
+lands the original body) into the inbound MCP text, so the agent
+sees forwarded content without needing an extra tool call.
+
+- `34cd08d` — initial feat: flatten Slack forward attachments into
+  inbound text.
+- `12c3863` — cap + provenance-wrap flattened forwards + tests.
+- `41530bd` — tighten cap accounting.
+- `8da7c91` — refactor: pull attach-merge into a helper (crap-score
+  gate unblock).
+- `12e8046` — fix: count `\n---\n` joiner into totalCap.
+- `5f49aa2` — populate `meta.forward_source_url` from Slack canonical
+  permalink (paired with agent-seed's forward-to-DM quick-memory
+  flow).
+
+**Files touched**: `lib.ts` primarily (`flattenSlackAttachments`),
+`server.ts` for wiring, tests.
+
+**Rebase discipline**: the cap logic is subtle; changes upstream
+that touch `chunkText` or inbound length limits may interact.
+
+## Cluster C — Owner-token read tools (sensitive)
+
+Adds fork-only MCP tools that read Slack via the owner's user OAuth
+token (`xoxp-`), gated by `access.userDmAllowlist` /
+`access.userReadAllowAll`. Journals every read as
+`gate.user_token.read`.
+
+- `a3bb7c9` — `fetch_user_dms` — read DM history with a specific
+  other user, allowlist-gated.
+- `16b489f` — `fetch_user_conversation` — read any channel/DM the
+  owner can see (only when `userReadAllowAll` is true).
+- `2835653` — `list_user_conversations` — enumerate channels/DMs
+  the owner can see (only under `userReadAllowAll`).
+- `9671a13` — fetch tools include message reactions in output.
+- `8a013eb` — document fork-only access fields in ACCESS.md.
+
+**Files touched**: `server.ts` (tool registration + handlers),
+`lib.ts` (access schema), `ACCESS.md`.
+
+**Rebase discipline**: three tools all share the user-token OAuth
+plumbing. If upstream refactors WebClient bootstrapping, verify all
+three still get the user client wired.
+
+## Cluster D — Interactive Block Kit output
+
+Adds fork-only `reply_with_choices` MCP tool for owner-approval
+buttons (Block Kit); the click callback returns as an MCP
+notification. Used by agent-seed's `/approve-proposal` +
+forward-to-DM quick-memory flows.
+
+- `b27d261` — `reply_with_choices` tool.
+- `dc0ef89` — `reply` defaults `stream=true` (opt-out).
+
+**Files touched**: `server.ts` (tool + handler), `lib.ts`
+(chunking with stream default), tests.
+
+**Rebase discipline**: upstream's `reply` tool signature changes
+here; a merge that pulls in an upstream `reply` refactor must
+reconcile the stream default.
+
+## Cluster E — Stream reply UX
+
+- `c2c76e2` — stream-reply emoji reactions + visible interrupt
+  suffix.
+- `d71dca3` — sanitize interrupt suffix + remove in-flight
+  reaction.
+
+**Files touched**: `stream-reply.ts`.
+
+## Cluster F — DM gate niceties
+
+- `f3fbe51` — gate: optional canned reply for non-allowlisted DMs
+  (helps operators discover the allowlist requirement).
+- `a454354` — `deniedDmOwnerPing` + `deniedDmCooldownSec` — bot
+  DMs the owner when a denied-DM comes in, with cooldown so it
+  doesn't spam.
+
+**Files touched**: `lib.ts` (gate), `server.ts` (owner ping),
+schema in `lib.ts`.
+
+## Cluster G — Stream-finalize obligation env-guard (Z-patch)
+
+- `3c656f8` — 3-line env-guard in `maybeBeginDurableStream`
+  (`server.ts:1550`): return null when
+  `SLACK_DISABLE_DURABLE_STREAM=1`. Disables the ccsc-o7x.6
+  stream-finalize obligation to avoid the poller-vs-stream
+  double-post race.
+
+**Files touched**: `server.ts` (3 lines).
+
+**Rebase discipline**: single, small, well-labeled. If a merge
+drops it, re-apply as a single hunk. Fleet wires the env in
+`agent-seed/templates/topic-mcp.json` +
+`agent-seed/tools/create-topic.sh` +
+`agent-seed/tools/run-topic.sh` migration.
+
+## Housekeeping (not patches)
+
+- `cf6feae`, `cb6fde0`, `a3e2a86` — upstream merge commits.
+- `d717502` — branch rename `feat/owner-role-hook` → `kjb/main`.
+- `640adfd` — added this file.
 
 ## Rebase checklist
 
 1. `git fetch upstream && git rebase upstream/main`.
-2. If conflicts land in `server.ts` around `maybeBeginDurableStream` — verify
-   the env guard survived. If dropped, cherry-pick `3c656f8`'s hunk.
-3. If conflicts land in the role-hook plumbing (`gate()`, `deriveRoleForSender`,
-   `loadRolesFile`) — resolve carefully; those are load-bearing security paths.
-4. Run `bun run typecheck` + `bun test` and confirm both pass before pushing.
-5. Update this file if a patch's location changed.
+2. Walk each cluster above and confirm its files still carry the
+   expected hunks. If a rebase drops a hunk, `git log` the specific
+   commit and cherry-pick.
+3. Run `bun run typecheck` + `bun test` and confirm both pass
+   before pushing.
+4. Update this file when a patch's location changes materially.
