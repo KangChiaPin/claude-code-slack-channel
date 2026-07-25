@@ -3941,9 +3941,21 @@ async function deliverEvent(ev: Record<string, unknown>, access: Access): Promis
   // Track this (channel, thread) pair as delivered (for outbound
   // gate). A thread-level key so replies cannot leak across
   // threads in the same channel (ccsc-xa3.6).
+  //
+  // kjb fork patch: add BOTH the raw-thread_ts key AND the
+  // ts-fallback key. The sessionKey below (line 3960-ish) uses
+  // `incomingThreadTs ?? (ev.ts as string)` — the ts fallback —
+  // and the bot's reply per framework's thread_ts-derivation
+  // rule uses `thread_ts = inbound's ts` for top-level inbounds.
+  // Without the fallback add, `assertOutboundAllowed` misses on
+  // every fresh top-level DM (which sends `thread_ts` = the
+  // message's ts) because deliveredThreads only holds `<chan>\0`.
+  // For threaded inbounds the two add() calls collapse to one
+  // via Set dedup, so this is safe.
   const channelId = ev.channel as string
   const incomingThreadTs = ev.thread_ts as string | undefined
   deliveredThreads.add(libDeliveredThreadKey(channelId, incomingThreadTs))
+  deliveredThreads.add(libDeliveredThreadKey(channelId, incomingThreadTs ?? (ev.ts as string)))
 
   // ccsc-apj.1 — mark this thread engaged for mention-stickiness, but ONLY
   // for human deliveries. A human mentioning the bot opens the thread for

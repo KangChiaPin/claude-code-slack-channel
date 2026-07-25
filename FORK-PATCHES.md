@@ -139,6 +139,35 @@ drops it, re-apply as a single hunk. Fleet wires the env in
 `agent-seed/tools/create-topic.sh` +
 `agent-seed/tools/run-topic.sh` migration.
 
+## Cluster H — deliveredThreads dual-key for top-level DMs
+
+- `server.ts:3946` — `deliverEvent` now adds BOTH the raw
+  `incomingThreadTs` key AND the `incomingThreadTs ?? ev.ts`
+  fallback key to `deliveredThreads`. Symmetric with the
+  sessionKey on the next line (which uses the ts-fallback
+  form).
+
+**Motivation.** Fresh top-level DM inbounds (`ev.thread_ts`
+undefined) added only `<channel>\0` (empty thread slot) to
+deliveredThreads. But the bot's session/notification carried
+`thread = ev.ts`, and per agent-seed's framework `thread_ts`
+derivation rule the reply used `thread_ts = ev.ts` → outbound
+gate checked `<channel>\0<ts>` → MISS → reply refused. Symptom:
+aetherscope bot (fresh DM, six independent top-level messages
+from owner, zero threaded follow-ups) couldn't reply to any of
+them. Long-lived DMs (microscopy-ai, aetherslide-genius) don't
+hit this because their traffic funnels through one persistent
+thread, which populates the key correctly on the FIRST threaded
+reply.
+
+**Files touched**: `server.ts` (2 lines).
+
+**Rebase discipline**: if upstream refactors `deliverEvent` or
+splits the deliveredThreads add out, re-apply both add() calls.
+Cross-thread isolation invariant (ccsc-xa3.5/6) preserved —
+bot in thread A → outbound to thread B still misses because
+B's ts was never inbound-delivered.
+
 ## Housekeeping (not patches)
 
 - `cf6feae`, `cb6fde0`, `a3e2a86` — upstream merge commits.
