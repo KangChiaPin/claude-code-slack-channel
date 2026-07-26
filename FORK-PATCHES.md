@@ -10,7 +10,7 @@ git log --oneline upstream/main..kjb/main
 git diff upstream/main..kjb/main --stat
 ```
 
-Fork carries **28 commits** ahead of upstream (as of 640adfd). The list
+Fork carries **29 commits** ahead of upstream (as of a5f77ed). The list
 below groups them into functional clusters. Merges + reverts are noted
 but not counted as separate patches.
 
@@ -167,6 +167,38 @@ splits the deliveredThreads add out, re-apply both add() calls.
 Cross-thread isolation invariant (ccsc-xa3.5/6) preserved —
 bot in thread A → outbound to thread B still misses because
 B's ts was never inbound-delivered.
+
+## Cluster I — slack_permalink meta attribute
+
+- `a5f77ed` — `server.ts` stores `auth.test().url` in
+  `slackWorkspaceUrl` at boot; `deliverEvent()` calls
+  `buildSlackPermalink()` and injects the result into meta as
+  `slack_permalink`. `lib.ts` `buildSlackPermalink()` synthesizes
+  the canonical URL from `(workspaceUrl, chatId, ts, threadTs?)`
+  with strict input validation — pure string, no network. Fails
+  open (returns `undefined`) on any malformed input so downstream
+  degrades gracefully. System-prompt hint updated to advertise the
+  new tag attribute.
+
+**Motivation.** Agent-seed framework 6c89f03 mandates
+`Slack-Requested-By:` + `Slack-Source:` commit trailers on every
+Slack-driven commit for grep-able audit trail. The `Slack-Source`
+line needs the canonical Slack permalink. Without this patch the
+agent couldn't produce one — the workspace subdomain is not in
+`<channel>` meta, and per-inbound `chat.getPermalink` API calls
+are extra latency + rate-limit risk. Client-side synthesis is
+free and deterministic once the workspace URL is known.
+
+**Files touched**: `server.ts` (~15 lines: identity state,
+`auth.test` capture, import, meta injection, prompt hint),
+`lib.ts` (`buildSlackPermalink` ~40 lines).
+
+**Rebase discipline**: `buildSlackPermalink` is a pure function
+with tight input validation — safe to relocate. If upstream
+refactors `deliverEvent`'s meta construction, re-apply the
+`slack_permalink` injection block. The regex constraints in
+the builder are what defuse a poisoned `auth.url` — don't
+loosen them.
 
 ## Housekeeping (not patches)
 
