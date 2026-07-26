@@ -29,6 +29,7 @@ import {
   buildAuditReceiptMessage,
   buildSecretPlaceholderMap,
   buildSecretValueSet,
+  buildSlackPermalink,
   type ChannelPolicy,
   chunkText,
   classifyDeliveryError,
@@ -19819,5 +19820,91 @@ describe('loadRolesFile', () => {
     const { map, unknownValues } = loadRolesFile('{"U0111": "🤖"}')
     expect(map.get('U0111')).toBe('contributor')
     expect(unknownValues).toContain('"🤖"')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// buildSlackPermalink — synthesize canonical Slack URLs for the
+// slack_permalink meta attribute (kjb fork Cluster I — Slack-Requested-By
+// commit-trailer support). Pure string construction, no network.
+// ---------------------------------------------------------------------------
+
+describe('buildSlackPermalink', () => {
+  const WORKSPACE = 'https://aetherai.slack.com/'
+
+  test('constructs canonical permalink for a top-level message', () => {
+    expect(buildSlackPermalink(WORKSPACE, 'C0123ABC', '1784863576.903149')).toBe(
+      'https://aetherai.slack.com/archives/C0123ABC/p1784863576903149',
+    )
+  })
+
+  test('appends thread_ts + cid query params for threaded replies', () => {
+    const out = buildSlackPermalink(WORKSPACE, 'C0123ABC', '1784863580.100200', '1784863576.903149')
+    expect(out).toBe(
+      'https://aetherai.slack.com/archives/C0123ABC/p1784863580100200?thread_ts=1784863576.903149&cid=C0123ABC',
+    )
+  })
+
+  test('DM chat_id (D-prefix) works the same as channel', () => {
+    expect(buildSlackPermalink(WORKSPACE, 'D0BKUHRME6N', '1784863576.903149')).toBe(
+      'https://aetherai.slack.com/archives/D0BKUHRME6N/p1784863576903149',
+    )
+  })
+
+  test('returns undefined when workspace URL is empty (auth.test not resolved)', () => {
+    expect(buildSlackPermalink('', 'C0123ABC', '1784863576.903149')).toBeUndefined()
+  })
+
+  test('returns undefined when chat_id is missing', () => {
+    expect(buildSlackPermalink(WORKSPACE, undefined, '1784863576.903149')).toBeUndefined()
+  })
+
+  test('returns undefined when ts is missing', () => {
+    expect(buildSlackPermalink(WORKSPACE, 'C0123ABC', undefined)).toBeUndefined()
+  })
+
+  test('rejects malformed workspace URL (http scheme)', () => {
+    expect(
+      buildSlackPermalink('http://aetherai.slack.com/', 'C0123ABC', '1784863576.903149'),
+    ).toBeUndefined()
+  })
+
+  test('rejects malformed workspace URL (missing trailing slash)', () => {
+    expect(
+      buildSlackPermalink('https://aetherai.slack.com', 'C0123ABC', '1784863576.903149'),
+    ).toBeUndefined()
+  })
+
+  test('rejects malformed workspace URL (non-slack.com host)', () => {
+    expect(
+      buildSlackPermalink('https://evil.example.com/', 'C0123ABC', '1784863576.903149'),
+    ).toBeUndefined()
+  })
+
+  test('rejects malformed workspace URL with attacker-controlled path segment', () => {
+    // Would concatenate to https://aetherai.slack.com/../evilarchives/... —
+    // regex requires the URL end at slack.com/ exactly, so this is refused.
+    expect(
+      buildSlackPermalink('https://aetherai.slack.com/../evil/', 'C0123ABC', '1784863576.903149'),
+    ).toBeUndefined()
+  })
+
+  test('rejects invalid chat_id (lowercase)', () => {
+    expect(buildSlackPermalink(WORKSPACE, 'c0123abc', '1784863576.903149')).toBeUndefined()
+  })
+
+  test('rejects invalid ts (no dot)', () => {
+    expect(buildSlackPermalink(WORKSPACE, 'C0123ABC', '1784863576903149')).toBeUndefined()
+  })
+
+  test('malformed thread_ts is silently dropped (still returns top-level permalink)', () => {
+    // Robust: main permalink still useful even if thread_ts is malformed.
+    const out = buildSlackPermalink(WORKSPACE, 'C0123ABC', '1784863580.100200', 'not-a-ts')
+    expect(out).toBe('https://aetherai.slack.com/archives/C0123ABC/p1784863580100200')
+  })
+
+  test('empty thread_ts is silently dropped', () => {
+    const out = buildSlackPermalink(WORKSPACE, 'C0123ABC', '1784863580.100200', '')
+    expect(out).toBe('https://aetherai.slack.com/archives/C0123ABC/p1784863580100200')
   })
 })

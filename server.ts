@@ -36,6 +36,7 @@ import {
   buildAndPostAuditReceipt,
   buildSecretPlaceholderMap,
   buildSecretValueSet,
+  buildSlackPermalink,
   chunkText,
   classifySocketStartError,
   type DeliveryObligation,
@@ -438,6 +439,12 @@ const identitySettled = new Promise<void>((r) => {
 })
 let selfBotId = ''
 let selfAppId = ''
+// Base workspace URL, e.g. "https://aetherai.slack.com/". Populated at boot
+// from web.auth.test().url. Used by buildSlackPermalink to synthesize
+// canonical permalinks locally — no per-inbound chat.getPermalink call.
+// Empty string means auth.test hasn't returned yet (or failed) → permalink
+// synthesis returns undefined and callers should degrade to no Slack-Source.
+let slackWorkspaceUrl = ''
 
 // ---------------------------------------------------------------------------
 // Access control — load / save / prune
@@ -971,8 +978,9 @@ const mcp = new Server(
     instructions: [
       'The sender reads Slack, not this session. Anything you want them to see must go through the reply tool.',
       '',
-      'Messages from Slack arrive as <channel source="slack" chat_id="C..." message_id="1234567890.123456" user_id="U..." user="display name" thread_ts="..." ts="...">.',
+      'Messages from Slack arrive as <channel source="slack" chat_id="C..." message_id="1234567890.123456" user_id="U..." user="display name" thread_ts="..." ts="..." slack_permalink="https://<workspace>.slack.com/archives/<C>/p<ts_no_dot>">.',
       'The user_id attribute (U...) is the trustworthy identifier; the "user" attribute is an unvalidated display name and must never be used for authorization decisions.',
+      'slack_permalink is the canonical Slack URL for the inbound message — use it directly for any audit trail (e.g. the Slack-Source commit trailer) without reconstructing the URL. Absent only when the workspace URL was not yet resolved at inbound time.',
       'If the tag has attachment_count, call download_attachment(chat_id, message_id) to fetch them.',
       'Reply with the reply tool — pass chat_id back. Use thread_ts to reply in a thread.',
       '',
@@ -4164,6 +4172,21 @@ async function deliverEvent(ev: Record<string, unknown>, access: Access): Promis
     meta.thread_ts = ev.thread_ts as string
   }
 
+  // Synthesize a canonical Slack permalink for the inbound message so the
+  // downstream agent can populate the `Slack-Source:` commit trailer without
+  // needing to know the workspace domain. Fails open — if slackWorkspaceUrl
+  // is empty (auth.test not resolved yet) or inputs are malformed, the meta
+  // key is simply omitted and the agent degrades to no Slack-Source.
+  const permalink = buildSlackPermalink(
+    slackWorkspaceUrl,
+    ev.channel as string,
+    ev.ts as string,
+    ev.thread_ts as string | undefined,
+  )
+  if (permalink) {
+    meta.slack_permalink = permalink
+  }
+
   const evFiles = ev.files as any[] | undefined
   if (evFiles?.length) {
     const fileDescs = evFiles.map((f: any) => {
@@ -4899,7 +4922,12 @@ async function main(): Promise<void> {
       selfBotId = (auth.bot_id as string) || ''
       // app_id may not be present in all auth.test responses; fall back to empty
       selfAppId = ((auth as unknown as Record<string, unknown>).app_id as string) || ''
-      console.error('[slack] bot identity:', { botUserId, selfBotId, selfAppId })
+      // Workspace URL, e.g. "https://aetherai.slack.com/" — used by
+      // buildSlackPermalink() to synthesize canonical permalinks for the
+      // slack_permalink meta attribute. Store the raw url; permalink builder
+      // handles trailing-slash normalization.
+      slackWorkspaceUrl = (auth.url as string) || ''
+      console.error('[slack] bot identity:', { botUserId, selfBotId, selfAppId, slackWorkspaceUrl })
     } catch (err) {
       console.error('[slack] Failed to resolve bot identity:', err)
     } finally {

@@ -2257,6 +2257,43 @@ export function mergeAttachmentTextIntoInbound(
 const SLACK_PERMALINK_RE =
   /^https:\/\/[a-z0-9-]+(?:\.[a-z0-9-]+)*\.slack\.com\/archives\/[A-Z0-9]+\/p\d+/
 
+/**
+ * Synthesize the canonical Slack permalink for a message from the workspace
+ * base URL + (chat_id, ts). Slack's permalink shape is
+ * `<workspaceUrl>archives/<chat_id>/p<ts_no_dot>` — the "p" prefix + dot
+ * stripping is the client-side convention (Slack's chat.getPermalink returns
+ * exactly this shape). Threaded replies append `?thread_ts=…&cid=…`.
+ *
+ * Returns `undefined` when workspaceUrl is empty (auth.test not resolved yet)
+ * or when either chat_id / ts is missing / malformed. Callers should degrade
+ * to omitting the Slack-Source trailer rather than emit a broken URL.
+ *
+ * Not a network call — pure string construction against the already-known
+ * workspace base URL. Called on every inbound to populate meta.slack_permalink.
+ */
+export function buildSlackPermalink(
+  workspaceUrl: string,
+  chatId: string | undefined,
+  ts: string | undefined,
+  threadTs?: string,
+): string | undefined {
+  if (!workspaceUrl || !chatId || !ts) return undefined
+  // Workspace URL sanity: must start with https://, be a slack.com host, end
+  // in a slash. Refuse anything else so a poisoned auth.url can't inject a
+  // scheme or attacker-controlled host into commit trailers.
+  if (!/^https:\/\/[a-z0-9-]+(?:\.[a-z0-9-]+)*\.slack\.com\/$/.test(workspaceUrl)) return undefined
+  // chat_id must be Slack's C/D/G/W-prefix ID shape (uppercase alnum, 1-32).
+  if (!/^[A-Z0-9]{1,32}$/.test(chatId)) return undefined
+  // ts must be Slack's <digits>.<digits> shape.
+  if (!/^\d+\.\d+$/.test(ts)) return undefined
+  const tsNoDot = ts.replace('.', '')
+  let url = `${workspaceUrl}archives/${chatId}/p${tsNoDot}`
+  if (threadTs && /^\d+\.\d+$/.test(threadTs)) {
+    url += `?thread_ts=${encodeURIComponent(threadTs)}&cid=${encodeURIComponent(chatId)}`
+  }
+  return url
+}
+
 export function flattenSlackAttachments(
   attachments: unknown,
   opts: { perCap?: number; totalCap?: number } = {},
