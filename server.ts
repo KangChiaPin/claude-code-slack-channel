@@ -325,10 +325,16 @@ const DENIED_DM_COOLDOWN_DEFAULT_SEC = 3600
  *  PreToolUse hook) never observes a half-written file. Best-effort: errors
  *  are logged and swallowed — failing to write the hook file MUST NOT block
  *  inbound message delivery to Claude. */
-function writeRoleHookFileAtomic(filePath: string, role: SenderRole): void {
+function writeRoleHookFileAtomic(filePath: string, role: SenderRole, userId?: string): void {
   const tmp = `${filePath}.${process.pid}.tmp`
+  // Format: role:user_id:unix_ts. The hook reads the LAST field as the
+  // timestamp (unchanged expiry behaviour) and the MIDDLE field as the
+  // sender. Role alone cannot distinguish one owner from another, and the
+  // claude.ai MCP connectors belong to the operator's account — not to
+  // whoever happens to hold owner on a topic.
+  const line = `${role}:${userId ?? ''}:${Math.floor(Date.now() / 1000)}`
   try {
-    writeFileSync(tmp, `${role}\n`, { mode: 0o600 })
+    writeFileSync(tmp, `${line}\n`, { mode: 0o600 })
     renameSync(tmp, filePath)
   } catch (err) {
     console.error(
@@ -2617,7 +2623,7 @@ async function handleChoiceClick(
   if (ROLE_HOOK_ENABLED) {
     derivedRole = deriveRoleNow(userIdSafe)
     meta.role = derivedRole
-    writeRoleHookFileAtomic(ROLE_HOOK_FILE, derivedRole)
+    writeRoleHookFileAtomic(ROLE_HOOK_FILE, derivedRole, userIdSafe)
   }
 
   journalWrite({
@@ -4222,7 +4228,7 @@ async function deliverEvent(ev: Record<string, unknown>, access: Access): Promis
   // agree on the same derived value).
   if (derivedRole !== undefined) {
     meta.role = derivedRole
-    writeRoleHookFileAtomic(ROLE_HOOK_FILE, derivedRole)
+    writeRoleHookFileAtomic(ROLE_HOOK_FILE, derivedRole, userIdSafe)
   }
 
   // Push into Claude Code session via MCP notification
