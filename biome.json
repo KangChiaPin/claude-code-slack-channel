@@ -9,6 +9,8 @@
       "journal.ts",
       "manifest.ts",
       "supervisor.ts",
+      "instance-state.ts",
+      "instance-state.test.ts",
       "server.test.ts",
       "features/**/*.ts",
       "scripts/**/*.ts",

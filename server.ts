@@ -27,6 +27,12 @@ import { WebClient } from '@slack/web-api'
 import { z } from 'zod'
 import { createTmuxSendKeys, dispatchAdminCommand, parseAdminCommand } from './admin.ts'
 import { loadSigningKey, parseNoAuditSigningFlag } from './audit-key-loader.ts'
+import {
+  loadEngagedThreads,
+  releaseSocketLock,
+  saveEngagedThreads,
+  tryAcquireSocketLock,
+} from './instance-state.ts'
 import { createBootAnchor, JournalWriter, verifyJournal } from './journal.ts'
 import {
   type Access,
@@ -779,11 +785,13 @@ const deliveredThreads = new Set<string>()
 // engaged thread without re-mentioning on a requireMention channel. Peer
 // bots are never added here as sticky — the inbound gate refuses to make
 // ev.bot_id messages sticky regardless. Session-lifetime cache.
-const engagedThreads = new Set<string>()
 // Bound the engaged-thread cache so it can't grow without limit over a long
 // process lifetime (CodeRabbit, PR #244). At capacity the oldest entry is
 // evicted; a human in an evicted thread simply re-mentions to re-engage.
 const MAX_ENGAGED_THREADS = 10_000
+// Persisted to STATE_DIR so a restart does not silently close every open
+// thread (see instance-state.ts).
+const engagedThreads = new Set<string>(loadEngagedThreads(STATE_DIR, MAX_ENGAGED_THREADS))
 
 /** Record a thread as engaged for mention-stickiness, bounding the cache.
  *  Sets iterate in insertion order, so the first key is the oldest; evict it
@@ -793,7 +801,13 @@ function recordEngagedThread(key: string): void {
     const oldest = engagedThreads.values().next().value
     if (oldest !== undefined) engagedThreads.delete(oldest)
   }
+  if (engagedThreads.has(key)) return
   engagedThreads.add(key)
+  try {
+    saveEngagedThreads(STATE_DIR, engagedThreads)
+  } catch (err) {
+    console.error('[slack] could not persist engaged threads:', err)
+  }
 }
 
 /** Build the SessionKey for an inbound event. When the channel opts into
@@ -4577,6 +4591,7 @@ let journal: JournalWriter | null = null
 async function shutdown(reason: string, code = 0): Promise<void> {
   if (shuttingDown) return
   shuttingDown = true
+  releaseSocketLock(STATE_DIR, process.pid)
   console.error(`[slack] Shutting down: ${reason}`)
 
   // Force-exit safety net: if socket/mcp close hangs, don't linger.
@@ -4950,6 +4965,30 @@ async function main(): Promise<void> {
     // backoff schedule are pure functions in lib.ts (classifySocketStartError /
     // nextSocketStartBackoffMs) so the boot-path classification is unit-tested
     // without importing this module (ccsc-x0t.4 / ccsc-x0t.10).
+    // One inbound socket per STATE_DIR (see instance-state.ts): while another
+    // live server holds the lock, stay outbound-only and wait for it to exit.
+    let lockWaitLogged = false
+    while (!shuttingDown) {
+      let lock: ReturnType<typeof tryAcquireSocketLock>
+      try {
+        lock = tryAcquireSocketLock(STATE_DIR, process.pid)
+      } catch (err) {
+        // An unwritable STATE_DIR must not keep the channel deaf; fall back
+        // to the unlocked behavior.
+        console.error('[slack] socket lock unavailable, connecting without it:', err)
+        break
+      }
+      if (lock.acquired) break
+      if (!lockWaitLogged) {
+        console.error(
+          `[slack] pid ${lock.holder} already holds the inbound socket for ${STATE_DIR}; ` +
+            'this server stays outbound-only until that process exits',
+        )
+        lockWaitLogged = true
+      }
+      await new Promise((r) => setTimeout(r, 5_000))
+    }
+
     const MAX_SOCKET_START_ATTEMPTS = 10
     let attempt = 0
     let delayMs = 2_000
