@@ -1,9 +1,11 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
+  appendInboundLog,
   ENGAGED_THREADS_FILE,
+  INBOUND_LOG_FILE,
   loadEngagedThreads,
   releaseSocketLock,
   SOCKET_LOCK_FILE,
@@ -76,5 +78,50 @@ describe('engaged threads', () => {
     expect(loadEngagedThreads(dir, 10)).toEqual([])
     writeFileSync(join(dir, ENGAGED_THREADS_FILE), JSON.stringify(['ok', 3, null]))
     expect(loadEngagedThreads(dir, 10)).toEqual(['ok'])
+  })
+})
+
+describe('inbound log', () => {
+  test('appends one JSON line per record with a timestamp', () => {
+    appendInboundLog(
+      dir,
+      { kind: 'deliver', chat_id: 'C1', ts: '1.1', thread_ts: '1.0', user_id: 'U1' },
+      new Date('2026-10-01T00:00:00Z'),
+    )
+    appendInboundLog(dir, {
+      kind: 'drop',
+      chat_id: 'C1',
+      ts: '1.2',
+      reason: 'channel.require_mention',
+    })
+    const lines = readFileSync(join(dir, INBOUND_LOG_FILE), 'utf8')
+      .trim()
+      .split('\n')
+      .map((l) => JSON.parse(l))
+    expect(lines[0]).toEqual({
+      at: '2026-10-01T00:00:00.000Z',
+      kind: 'deliver',
+      chat_id: 'C1',
+      ts: '1.1',
+      thread_ts: '1.0',
+      user_id: 'U1',
+    })
+    expect(lines[1].reason).toBe('channel.require_mention')
+  })
+
+  test('trims to the newest lines past the size cap', () => {
+    const big = 'x'.repeat(500)
+    for (let i = 0; i < 4500; i++)
+      appendInboundLog(dir, { kind: 'drop', chat_id: 'C1', ts: `${i}.0`, reason: big })
+    const lines = readFileSync(join(dir, INBOUND_LOG_FILE), 'utf8').trim().split('\n')
+    expect(statSync(join(dir, INBOUND_LOG_FILE)).size).toBeLessThanOrEqual(2_000_000)
+    expect(lines.length).toBeGreaterThan(1_000)
+    expect(JSON.parse(lines[lines.length - 1]).ts).toBe('4499.0')
+  })
+
+  test('an unwritable state dir does not throw', () => {
+    expect(() =>
+      appendInboundLog(join(dir, 'missing', 'deeper'), { kind: 'deliver', chat_id: 'C', ts: '1' }),
+    ).not.toThrow()
   })
 })

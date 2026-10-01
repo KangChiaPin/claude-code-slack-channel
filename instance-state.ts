@@ -23,8 +23,26 @@
  *    threads: a follow-up in a conversation from before the restart was
  *    dropped as `channel.require_mention`, and from the asker's side the bot
  *    simply stopped answering.
+ *
+ * 3. Inbound log — every message delivered to, or dropped before, the session.
+ *
+ *    `inbound.jsonl` is the plugin's own record of what it handed the
+ *    session. A host can check it against its own bookkeeping (agent-seed's
+ *    task ledger does, at the end of every main-session turn) to catch a
+ *    message that reached the session and was never acted on. Drops carry the
+ *    gate's reason, so a message that never arrived can be traced to the rule
+ *    that stopped it. Always on; it is host-local state like
+ *    `sessions/`, never sent anywhere.
  */
-import { existsSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs'
+import {
+  appendFileSync,
+  existsSync,
+  readFileSync,
+  renameSync,
+  statSync,
+  unlinkSync,
+  writeFileSync,
+} from 'node:fs'
 import { join } from 'node:path'
 
 export const SOCKET_LOCK_FILE = 'socket.lock'
@@ -102,4 +120,47 @@ export function saveEngagedThreads(stateDir: string, keys: Iterable<string>): vo
   const tmp = `${path}.${process.pid}.tmp`
   writeFileSync(tmp, JSON.stringify([...keys]), { mode: 0o600 })
   renameSync(tmp, path)
+}
+
+export const INBOUND_LOG_FILE = 'inbound.jsonl'
+const INBOUND_LOG_MAX_BYTES = 2_000_000
+
+export type InboundRecord = {
+  kind: 'deliver' | 'drop'
+  chat_id: string
+  ts: string
+  thread_ts?: string
+  user_id?: string
+  reason?: string
+}
+
+/** Append one inbound record, trimming the file to its newest lines once it
+ *  passes the size cap. Never throws: a logging failure must not stop a
+ *  message from being delivered. */
+export function appendInboundLog(
+  stateDir: string,
+  rec: InboundRecord,
+  now: Date = new Date(),
+): void {
+  const path = join(stateDir, INBOUND_LOG_FILE)
+  try {
+    appendFileSync(path, `${JSON.stringify({ at: now.toISOString(), ...rec })}\n`, { mode: 0o600 })
+    if (statSync(path).size > INBOUND_LOG_MAX_BYTES) {
+      // Keep the newest lines up to half the cap, so the next trim is far
+      // away instead of on every following append.
+      const lines = readFileSync(path, 'utf8').trimEnd().split('\n')
+      const kept: string[] = []
+      let bytes = 0
+      for (let i = lines.length - 1; i >= 0; i--) {
+        bytes += Buffer.byteLength(lines[i] as string) + 1
+        if (bytes > INBOUND_LOG_MAX_BYTES / 2) break
+        kept.push(lines[i] as string)
+      }
+      const tmp = `${path}.${process.pid}.tmp`
+      writeFileSync(tmp, `${kept.reverse().join('\n')}\n`, { mode: 0o600 })
+      renameSync(tmp, path)
+    }
+  } catch {
+    /* best effort */
+  }
 }

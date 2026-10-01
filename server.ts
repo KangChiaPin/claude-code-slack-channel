@@ -28,6 +28,7 @@ import { z } from 'zod'
 import { createTmuxSendKeys, dispatchAdminCommand, parseAdminCommand } from './admin.ts'
 import { loadSigningKey, parseNoAuditSigningFlag } from './audit-key-loader.ts'
 import {
+  appendInboundLog,
   loadEngagedThreads,
   releaseSocketLock,
   saveEngagedThreads,
@@ -4250,6 +4251,13 @@ async function deliverEvent(ev: Record<string, unknown>, access: Access): Promis
     method: 'notifications/claude/channel',
     params: { content: text, meta },
   })
+  appendInboundLog(STATE_DIR, {
+    kind: 'deliver',
+    chat_id: channelId,
+    ts: ev.ts as string,
+    ...(incomingThreadTs !== undefined ? { thread_ts: incomingThreadTs } : {}),
+    ...(typeof ev.user === 'string' ? { user_id: ev.user } : {}),
+  })
 }
 
 async function handleMessage(event: unknown): Promise<void> {
@@ -4277,6 +4285,16 @@ async function handleMessage(event: unknown): Promise<void> {
         },
         ...(result.dropReason !== undefined ? { reason: result.dropReason } : {}),
       })
+      if (typeof ev.channel === 'string' && typeof ev.ts === 'string' && !ev.bot_id) {
+        appendInboundLog(STATE_DIR, {
+          kind: 'drop',
+          chat_id: ev.channel,
+          ts: ev.ts,
+          ...(typeof ev.thread_ts === 'string' ? { thread_ts: ev.thread_ts } : {}),
+          ...(typeof ev.user === 'string' ? { user_id: ev.user } : {}),
+          reason: result.dropReason ?? 'unspecified',
+        })
+      }
       // Optional canned breadcrumb + owner ping for DMs from non-allowlisted
       // users. Drop already prevented MCP delivery (zero tokens consumed);
       // these run from the plugin directly. Both are throttled by a per-
