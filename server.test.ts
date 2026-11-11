@@ -13265,6 +13265,8 @@ describe('MCP tool input schemas (S5)', () => {
     })
     .strict()
 
+  const UnreactInput = ReactInput
+
   const EditMessageInput = z
     .object({
       chat_id: z.string().min(1),
@@ -13427,6 +13429,26 @@ describe('MCP tool input schemas (S5)', () => {
         message_id: '1234567890.123456',
         emoji: 'thumbsup',
         bogus: true,
+      })
+      expect(result.success).toBe(false)
+    })
+  })
+
+  describe('UnreactInput', () => {
+    test('accepts valid input with thread_ts', () => {
+      const result = UnreactInput.safeParse({
+        chat_id: 'D123',
+        message_id: '1234567890.123456',
+        emoji: 'eyes',
+        thread_ts: '1234567890.123456',
+      })
+      expect(result.success).toBe(true)
+    })
+
+    test('rejects missing emoji (required field)', () => {
+      const result = UnreactInput.safeParse({
+        chat_id: 'C123',
+        message_id: '1234567890.123456',
       })
       expect(result.success).toBe(false)
     })
@@ -19906,5 +19928,39 @@ describe('buildSlackPermalink', () => {
   test('empty thread_ts is silently dropped', () => {
     const out = buildSlackPermalink(WORKSPACE, 'C0123ABC', '1784863580.100200', '')
     expect(out).toBe('https://aetherai.slack.com/archives/C0123ABC/p1784863580100200')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// unreact — no_reaction is treated as success
+// ---------------------------------------------------------------------------
+
+describe('isNoReactionError', () => {
+  test('matches the Slack platform error for a missing reaction', async () => {
+    const { isNoReactionError } = await import('./lib.ts')
+    const err = Object.assign(new Error('An API error occurred: no_reaction'), {
+      code: 'slack_webapi_platform_error',
+      data: { ok: false, error: 'no_reaction' },
+    })
+    expect(isNoReactionError(err)).toBe(true)
+  })
+
+  test('does not swallow other Slack errors', async () => {
+    const { isNoReactionError } = await import('./lib.ts')
+    const err = Object.assign(new Error('An API error occurred: channel_not_found'), {
+      data: { ok: false, error: 'channel_not_found' },
+    })
+    expect(isNoReactionError(err)).toBe(false)
+    expect(isNoReactionError(new Error('network'))).toBe(false)
+    expect(isNoReactionError(undefined)).toBe(false)
+  })
+})
+
+describe('unreact tool registration', () => {
+  test('server.ts registers unreact in toolSchemas, ListTools and toolHandlers', () => {
+    const src = readFileSync(join(import.meta.dir, 'server.ts'), 'utf8')
+    expect(src).toMatch(/^\s*unreact: UnreactInput,$/m)
+    expect(src).toMatch(/name: 'unreact',/)
+    expect(src).toMatch(/^\s*unreact: executeUnreact,$/m)
   })
 })

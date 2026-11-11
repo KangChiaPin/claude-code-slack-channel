@@ -200,6 +200,22 @@ refactors `deliverEvent`'s meta construction, re-apply the
 the builder are what defuse a poisoned `auth.url` — don't
 loosen them.
 
+## Cluster J — `unreact` tool
+
+Agents swap progress markers on the inbound message (👀 from the
+plugin's ack → 🧠 when the agent records a task → ✅ when the reply is
+out). Upstream only ships `react`, which can add but never remove.
+
+- `unreact` MCP tool: `reactions.remove` behind the same outbound gate
+  as `react` (shared `gateReaction`). A `no_reaction` error is treated
+  as success so a retried swap does not fail on the half that already
+  happened (`isNoReactionError` in `lib.ts`).
+- `react` and `unreact` both advertise the optional `thread_ts` input
+  that `ReactInput` already accepted, so agents can pass it for DMs
+  and thread-only deliveries.
+
+**Files touched**: `server.ts`, `lib.ts`, `server.test.ts`.
+
 ## Housekeeping (not patches)
 
 - `cf6feae`, `cb6fde0`, `a3e2a86` — upstream merge commits.

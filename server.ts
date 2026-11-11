@@ -59,6 +59,7 @@ import {
   type GateResult,
   getChannelPolicy,
   isDuplicateEvent,
+  isNoReactionError,
   isSlackFileUrl,
   LIST_SESSIONS_MAX,
   assertNoSecretValues as libAssertNoSecretValues,
@@ -1055,6 +1056,8 @@ const ReactInput = z
   })
   .strict()
 
+const UnreactInput = ReactInput
+
 const EditMessageInput = z
   .object({
     chat_id: z.string().min(1),
@@ -1199,6 +1202,7 @@ const PublishManifestInput = z
 export const toolSchemas = {
   reply: ReplyInput,
   react: ReactInput,
+  unreact: UnreactInput,
   edit_message: EditMessageInput,
   fetch_messages: FetchMessagesInput,
   fetch_user_dms: FetchUserDmsInput,
@@ -1246,6 +1250,33 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
           emoji: {
             type: 'string',
             description: 'Emoji name without colons (e.g. "thumbsup")',
+          },
+          thread_ts: {
+            type: 'string',
+            description:
+              'Thread the message lives in. Needed for DMs and thread-only deliveries, where the outbound gate checks the (channel, thread) pair.',
+          },
+        },
+        required: ['chat_id', 'message_id', 'emoji'],
+      },
+    },
+    {
+      name: 'unreact',
+      description:
+        "Remove this bot's own emoji reaction from a Slack message. Succeeds when the reaction is already gone.",
+      inputSchema: {
+        type: 'object' as const,
+        properties: {
+          chat_id: { type: 'string', description: 'Channel ID' },
+          message_id: { type: 'string', description: 'Message timestamp (ts)' },
+          emoji: {
+            type: 'string',
+            description: 'Emoji name without colons (e.g. "eyes")',
+          },
+          thread_ts: {
+            type: 'string',
+            description:
+              'Thread the message lives in. Needed for DMs and thread-only deliveries, where the outbound gate checks the (channel, thread) pair.',
           },
         },
         required: ['chat_id', 'message_id', 'emoji'],
@@ -2014,19 +2045,22 @@ async function executeReply(args: Record<string, any>, ctx: ToolContext): Promis
 // -----------------------------------------------------------------------
 // react
 // -----------------------------------------------------------------------
-async function executeReact(args: Record<string, any>, ctx: ToolContext): Promise<ToolResult> {
-  // react operates on a specific message ts; the "thread" it
-  // engages with is whatever thread that message lives in.
-  // Callers that know the parent thread pass `thread_ts`; when
-  // omitted, fall back to channel-level opt-in or top-level
-  // delivery by passing undefined.
+// react / unreact operate on a specific message ts; the "thread" they
+// engage with is whatever thread that message lives in. Callers that
+// know the parent thread pass `thread_ts`; when omitted, fall back to
+// channel-level opt-in or top-level delivery by passing undefined.
+function gateReaction(
+  toolName: 'react' | 'unreact',
+  args: Record<string, any>,
+  ctx: ToolContext,
+): void {
   try {
     ctx.assertOutboundAllowed(args.chat_id, args.thread_ts)
   } catch (outboundErr) {
     ctx.journalWrite({
       kind: 'gate.outbound.deny',
       outcome: 'deny',
-      toolName: 'react',
+      toolName,
       sessionKey:
         args.thread_ts !== undefined
           ? { channel: args.chat_id, thread: args.thread_ts }
@@ -2039,11 +2073,15 @@ async function executeReact(args: Record<string, any>, ctx: ToolContext): Promis
   ctx.journalWrite({
     kind: 'gate.outbound.allow',
     outcome: 'allow',
-    toolName: 'react',
+    toolName,
     sessionKey:
       args.thread_ts !== undefined ? { channel: args.chat_id, thread: args.thread_ts } : undefined,
     input: { channel: args.chat_id, thread_ts: args.thread_ts },
   })
+}
+
+async function executeReact(args: Record<string, any>, ctx: ToolContext): Promise<ToolResult> {
+  gateReaction('react', args, ctx)
   await ctx.web.reactions.add({
     channel: args.chat_id,
     timestamp: args.message_id,
@@ -2051,6 +2089,28 @@ async function executeReact(args: Record<string, any>, ctx: ToolContext): Promis
   })
   return {
     content: [{ type: 'text', text: `Reacted :${args.emoji}: to ${args.message_id}` }],
+  }
+}
+
+// -----------------------------------------------------------------------
+// unreact
+// -----------------------------------------------------------------------
+async function executeUnreact(args: Record<string, any>, ctx: ToolContext): Promise<ToolResult> {
+  gateReaction('unreact', args, ctx)
+  try {
+    await ctx.web.reactions.remove({
+      channel: args.chat_id,
+      timestamp: args.message_id,
+      name: args.emoji,
+    })
+  } catch (err) {
+    // Removing a reaction that is not there is the desired end state,
+    // so treat it as success. Agents swap markers (👀 → 🧠 → ✅) and a
+    // retried swap must not fail on the half that already happened.
+    if (!isNoReactionError(err)) throw err
+  }
+  return {
+    content: [{ type: 'text', text: `Removed :${args.emoji}: from ${args.message_id}` }],
   }
 }
 
@@ -3122,6 +3182,7 @@ type ToolHandler = (args: Record<string, any>, ctx: ToolContext) => Promise<Tool
 const toolHandlers: Record<string, ToolHandler> = {
   reply: executeReply,
   react: executeReact,
+  unreact: executeUnreact,
   edit_message: executeEditMessage,
   fetch_messages: executeFetchMessages,
   fetch_user_dms: executeFetchUserDms,

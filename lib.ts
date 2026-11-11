@@ -3175,3 +3175,15 @@ export function formatVerifyResult(
   lines.push(`  events verified before break: ${result.eventsVerified}`)
   return { text: lines.join('\n'), exitCode: 1 }
 }
+
+/**
+ * True when a Slack Web API error says the reaction to remove is not on
+ * the message (`reactions.remove` → `no_reaction`). Callers treat that
+ * as success: the reaction being absent is what they asked for.
+ */
+export function isNoReactionError(err: unknown): boolean {
+  if (typeof err !== 'object' || err === null) return false
+  const data = (err as { data?: unknown }).data
+  if (typeof data !== 'object' || data === null) return false
+  return (data as { error?: unknown }).error === 'no_reaction'
+}
