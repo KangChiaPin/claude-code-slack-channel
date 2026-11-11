@@ -214,7 +214,7 @@ out). Upstream only ships `react`, which can add but never remove.
   that `ReactInput` already accepted, so agents can pass it for DMs
   and thread-only deliveries.
 
-**Files touched**: `server.ts`, `lib.ts`, `server.test.ts`.
+**Files touched**: `reactions.ts` (react + unreact bodies, moved out of `server.ts` so they can be tested with a fake Slack client), `reactions.test.ts`, `server.ts`, `lib.ts`, `server.test.ts`.
 
 ## Housekeeping (not patches)
 

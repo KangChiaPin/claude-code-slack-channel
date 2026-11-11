@@ -59,7 +59,6 @@ import {
   type GateResult,
   getChannelPolicy,
   isDuplicateEvent,
-  isNoReactionError,
   isSlackFileUrl,
   LIST_SESSIONS_MAX,
   assertNoSecretValues as libAssertNoSecretValues,
@@ -119,6 +118,11 @@ import {
   policyDigest,
   evaluate as policyEvaluate,
 } from './policy.ts'
+import {
+  type ReactionArgs,
+  executeReact as reactTool,
+  executeUnreact as unreactTool,
+} from './reactions.ts'
 import {
   beginDurableStream,
   createDeliverySendDeps,
@@ -2043,76 +2047,12 @@ async function executeReply(args: Record<string, any>, ctx: ToolContext): Promis
 }
 
 // -----------------------------------------------------------------------
-// react
+// react / unreact — bodies live in reactions.ts
 // -----------------------------------------------------------------------
-// react / unreact operate on a specific message ts; the "thread" they
-// engage with is whatever thread that message lives in. Callers that
-// know the parent thread pass `thread_ts`; when omitted, fall back to
-// channel-level opt-in or top-level delivery by passing undefined.
-function gateReaction(
-  toolName: 'react' | 'unreact',
-  args: Record<string, any>,
-  ctx: ToolContext,
-): void {
-  try {
-    ctx.assertOutboundAllowed(args.chat_id, args.thread_ts)
-  } catch (outboundErr) {
-    ctx.journalWrite({
-      kind: 'gate.outbound.deny',
-      outcome: 'deny',
-      toolName,
-      sessionKey:
-        args.thread_ts !== undefined
-          ? { channel: args.chat_id, thread: args.thread_ts }
-          : undefined,
-      input: { channel: args.chat_id, thread_ts: args.thread_ts },
-      reason: outboundErr instanceof Error ? outboundErr.message : String(outboundErr),
-    })
-    throw outboundErr
-  }
-  ctx.journalWrite({
-    kind: 'gate.outbound.allow',
-    outcome: 'allow',
-    toolName,
-    sessionKey:
-      args.thread_ts !== undefined ? { channel: args.chat_id, thread: args.thread_ts } : undefined,
-    input: { channel: args.chat_id, thread_ts: args.thread_ts },
-  })
-}
-
-async function executeReact(args: Record<string, any>, ctx: ToolContext): Promise<ToolResult> {
-  gateReaction('react', args, ctx)
-  await ctx.web.reactions.add({
-    channel: args.chat_id,
-    timestamp: args.message_id,
-    name: args.emoji,
-  })
-  return {
-    content: [{ type: 'text', text: `Reacted :${args.emoji}: to ${args.message_id}` }],
-  }
-}
-
-// -----------------------------------------------------------------------
-// unreact
-// -----------------------------------------------------------------------
-async function executeUnreact(args: Record<string, any>, ctx: ToolContext): Promise<ToolResult> {
-  gateReaction('unreact', args, ctx)
-  try {
-    await ctx.web.reactions.remove({
-      channel: args.chat_id,
-      timestamp: args.message_id,
-      name: args.emoji,
-    })
-  } catch (err) {
-    // Removing a reaction that is not there is the desired end state,
-    // so treat it as success. Agents swap markers (👀 → 🧠 → ✅) and a
-    // retried swap must not fail on the half that already happened.
-    if (!isNoReactionError(err)) throw err
-  }
-  return {
-    content: [{ type: 'text', text: `Removed :${args.emoji}: from ${args.message_id}` }],
-  }
-}
+const executeReact = (args: Record<string, any>, ctx: ToolContext): Promise<ToolResult> =>
+  reactTool(args as ReactionArgs, ctx)
+const executeUnreact = (args: Record<string, any>, ctx: ToolContext): Promise<ToolResult> =>
+  unreactTool(args as ReactionArgs, ctx)
 
 // -----------------------------------------------------------------------
 // edit_message
